@@ -1,0 +1,20 @@
+transaction:
+  hash: hex_string
+  size: bigint
+  virtual_size: bigint
+  version: bigint
+  lock_time: bigint
+  block_number: bigint
+  block_hash: hex_string
+  block_timestamp: bigint
+  is_coinbase: boolean
+  index: bigint
+  inputs: 
+    - transaction_input
+  outputs:
+    - transaction_output
+  input_count: bigint
+  output_count: bigint
+  input_value: bigint
+  output_value: bigint
+  fee: bigint
