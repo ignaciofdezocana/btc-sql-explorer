@@ -2,7 +2,7 @@
 """
 Bitcoin Blockchain DuckDB Setup
 
-This script sets up DuckDB with the Bitcoin blockchain CSV files and provides example queries.
+This script sets up DuckDB with the Bitcoin blockchain Parquet files and provides example queries.
 """
 
 import duckdb
@@ -10,7 +10,7 @@ import pandas as pd
 import os
 
 def setup_database():
-    """Set up DuckDB database and load CSV files"""
+    """Set up DuckDB database and load Parquet files"""
     
     # Create a new DuckDB connection
     con = duckdb.connect('bitcoin_blockchain.db')
@@ -24,29 +24,58 @@ def setup_database():
     con.execute("DROP TABLE IF EXISTS transaction_inputs")
     con.execute("DROP TABLE IF EXISTS transaction_outputs")
     
-    # Create tables from CSV files
-    print("Loading blocks.csv...")
+    # Create tables from Parquet files with formatted timestamps
+    print("Loading blocks.parquet with formatted timestamps...")
     con.execute("""
         CREATE TABLE blocks AS 
-        SELECT * FROM read_csv_auto('blocks.csv')
+        SELECT 
+            hash,
+            number,
+            strftime('%Y-%m-%d %H:%M:%S', timestamp 'epoch' + timestamp * interval '1 second') as timestamp,
+            merkle_root,
+            bits,
+            nonce,
+            version,
+            weight,
+            size,
+            stripped_size,
+            transaction_count,
+            coinbase_param
+        FROM read_parquet('blocks.parquet')
     """)
     
-    print("Loading transactions.csv...")
+    print("Loading transactions.parquet with formatted timestamps...")
     con.execute("""
         CREATE TABLE transactions AS 
-        SELECT * FROM read_csv_auto('transactions.csv')
+        SELECT 
+            hash,
+            block_hash,
+            block_number,
+            strftime('%Y-%m-%d %H:%M:%S', timestamp 'epoch' + block_timestamp * interval '1 second') as block_timestamp,
+            is_coinbase,
+            index,
+            input_count,
+            output_count,
+            input_value,
+            output_value,
+            fee,
+            size,
+            virtual_size,
+            version,
+            lock_time
+        FROM read_parquet('transactions.parquet')
     """)
     
-    print("Loading transaction_inputs.csv...")
+    print("Loading transaction_inputs.parquet...")
     con.execute("""
         CREATE TABLE transaction_inputs AS 
-        SELECT * FROM read_csv_auto('transaction_inputs.csv')
+        SELECT * FROM read_parquet('transaction_inputs.parquet')
     """)
     
-    print("Loading transaction_outputs.csv...")
+    print("Loading transaction_outputs.parquet...")
     con.execute("""
         CREATE TABLE transaction_outputs AS 
-        SELECT * FROM read_csv_auto('transaction_outputs.csv')
+        SELECT * FROM read_parquet('transaction_outputs.parquet')
     """)
     
     # Create indexes for better query performance
@@ -90,8 +119,8 @@ def run_example_queries(con):
             COUNT(*) as total_transactions,
             COUNT(CASE WHEN is_coinbase THEN 1 END) as coinbase_transactions,
             COUNT(CASE WHEN NOT is_coinbase THEN 1 END) as regular_transactions,
-            AVG(output_value) as avg_output_value,
-            SUM(output_value) as total_output_value
+            ROUND(AVG(output_value / 100000000.0), 8) as avg_output_value_btc,
+            ROUND(SUM(output_value / 100000000.0), 2) as total_output_value_btc
         FROM transactions
     """).fetchdf()
     print(result.to_string(index=False))
@@ -102,26 +131,26 @@ def run_example_queries(con):
     result = con.execute("""
         SELECT 
             number,
-            hash,
+            SUBSTR(hash, 1, 16) || '...' as hash_short,
             transaction_count,
             timestamp,
-            size
+            ROUND(size / 1024.0, 2) as size_kb
         FROM blocks 
         ORDER BY transaction_count DESC 
         LIMIT 10
     """).fetchdf()
     print(result.to_string(index=False))
     
-    # Query 4: Transaction volume over time (by day) - using epoch to date conversion
+    # Query 4: Transaction volume over time (by day)
     print("\n4. Daily Transaction Volume (first 10 days):")
     print("-" * 40)
     result = con.execute("""
         SELECT 
-            DATE(timestamp 'epoch' + block_timestamp * interval '1 second') as date,
+            DATE(block_timestamp) as date,
             COUNT(*) as transaction_count,
-            SUM(output_value) as total_volume
+            ROUND(SUM(output_value / 100000000.0), 2) as total_volume_btc
         FROM transactions 
-        GROUP BY DATE(timestamp 'epoch' + block_timestamp * interval '1 second')
+        GROUP BY DATE(block_timestamp)
         ORDER BY date
         LIMIT 10
     """).fetchdf()
@@ -132,8 +161,8 @@ def run_example_queries(con):
     print("-" * 40)
     result = con.execute("""
         SELECT 
-            hash,
-            output_value,
+            SUBSTR(hash, 1, 16) || '...' as hash_short,
+            ROUND(output_value / 100000000.0, 8) as output_value_btc,
             input_count,
             output_count,
             is_coinbase,
@@ -192,13 +221,13 @@ def interactive_mode(con):
             print(f"Error: {e}")
 
 def main():
-    # Check if CSV files exist
-    required_files = ['blocks.csv', 'transactions.csv', 'transaction_inputs.csv', 'transaction_outputs.csv']
+    # Check if Parquet files exist
+    required_files = ['blocks.parquet', 'transactions.parquet', 'transaction_inputs.parquet', 'transaction_outputs.parquet']
     missing_files = [f for f in required_files if not os.path.exists(f)]
     
     if missing_files:
-        print(f"Error: Missing required CSV files: {missing_files}")
-        print("Please run btc_parser.py first to generate the CSV files.")
+        print(f"Error: Missing required Parquet files: {missing_files}")
+        print("Please run btc_parser.py first to generate the Parquet files.")
         return
     
     # Set up database
