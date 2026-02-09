@@ -1,0 +1,24 @@
+services:
+  bitcoin-testnet4:
+    image: bitcoin/bitcoin:29
+    container_name: btc-testnet4
+    restart: unless-stopped
+    ports:
+      - "48332:48332"   # RPC
+      - "48333:48333"   # P2P
+    volumes:
+      - btc-testnet4-data:/home/bitcoin/.bitcoin
+    command:
+      - -testnet4=1
+      - -server
+      - -rest
+      - -txindex=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=48332
+      - -rpcuser=bitcoin
+      - -rpcpassword=bitcoin
+      - -printtoconsole
+
+volumes:
+  btc-testnet4-data:

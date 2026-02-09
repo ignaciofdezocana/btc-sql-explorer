@@ -1,0 +1,39 @@
+# ── Databases ──
+*.db
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+
+# ── Node / Frontend ──
+frontend/node_modules/
+frontend/dist/
+
+# ── Docker / Bitcoin Core data ──
+btc-testnet4-data/
+
+# ── IDE / OS ──
+.vscode/
+.idea/
+.cursor/
+.DS_Store
+*.swp
+*~
+
+# ── Logs & temp ──
+*.log
+*.tmp
+
+# ── Data files (never check in) ──
+*.dat
+*.parquet
+*.csv
+*.json.gz
+*.tar.gz
+*.zip

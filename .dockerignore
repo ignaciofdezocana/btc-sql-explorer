@@ -1,0 +1,25 @@
+# Node modules (rebuilt inside container)
+frontend/node_modules/
+frontend/dist/
+
+# Local databases
+*.db
+
+# Git / IDE
+.git
+.gitignore
+.gitattributes
+.cursor/
+.vscode/
+
+# Bitcoin data
+btc-testnet4-data/
+
+# Not needed in image
+__pycache__/
+*.pyc
+*.parquet
+*.dat
+README.md
+docker-compose.yml
+setup.sh
