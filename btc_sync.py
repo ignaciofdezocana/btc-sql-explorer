@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -191,6 +192,38 @@ CREATE TABLE IF NOT EXISTS transaction_outputs (
     type                VARCHAR,
     addresses           VARCHAR[],
     value               BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS mempool_transactions (
+    txid                VARCHAR NOT NULL,
+    size                BIGINT,
+    vsize               BIGINT,
+    weight              BIGINT,
+    fee                 BIGINT,
+    modified_fee        BIGINT,
+    ancestor_count      BIGINT,
+    ancestor_size       BIGINT,
+    ancestor_fees       BIGINT,
+    descendant_count    BIGINT,
+    descendant_size     BIGINT,
+    descendant_fees     BIGINT,
+    time_entered        BIGINT,
+    height_entered      BIGINT,
+    bip125_replaceable  BOOLEAN,
+    depends             VARCHAR[],
+    spentby             VARCHAR[],
+    snapshot_time       BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS mempool_snapshots (
+    snapshot_time       BIGINT NOT NULL,
+    tx_count            BIGINT,
+    total_bytes         BIGINT,
+    total_fee           BIGINT,
+    memory_usage        BIGINT,
+    max_mempool         BIGINT,
+    min_fee_rate        DOUBLE,
+    min_relay_fee       DOUBLE
 );
 """
 
@@ -670,6 +703,172 @@ def sync(rpc: BitcoinRPC, db_path: str, batch_size: int):
         elapsed_sec=round(elapsed),
         eta_sec=0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Thread entry point (used by btc_web_app.py for in-process sync)
+# ---------------------------------------------------------------------------
+
+def sync_thread(
+    con: duckdb.DuckDBPyConnection,
+    write_lock: threading.Lock,
+    stop_event: threading.Event,
+    rpc_url: str,
+    rpc_user: str,
+    rpc_password: str,
+    db_path: str,
+    batch_size: int = 50,
+    poll_interval: int = 30,
+):
+    """Run blockchain sync in a background thread.
+
+    Uses *con* (a shared DuckDB connection) for all writes, acquiring
+    *write_lock* for each batch so mempool writes and reader cursors
+    are never blocked for long.  Loops forever (with *poll_interval*
+    sleeps between tip checks) until *stop_event* is set.
+    """
+    rpc = BitcoinRPC(rpc_url, rpc_user, rpc_password)
+
+    # Wait for node to be reachable and past IBD
+    print("[sync-thread] Waiting for Bitcoin Core node...", flush=True)
+    write_status(db_path, state="waiting_for_node",
+                 message="Connecting to Bitcoin Core node...")
+    while not stop_event.is_set():
+        try:
+            info = rpc.getblockchaininfo()
+            chain = info.get("chain", "unknown")
+            ibd = info.get("initialblockdownload", True)
+            blocks = info.get("blocks", 0)
+            headers = info.get("headers", 0)
+            if ibd:
+                pct = (blocks / headers * 100) if headers else 0
+                print(f"[sync-thread] IBD {pct:.1f}% ({blocks}/{headers}) [{chain}]", flush=True)
+                write_status(db_path,
+                    state="node_ibd",
+                    message=f"Bitcoin Core is syncing the blockchain ({pct:.1f}%)",
+                    node_blocks=blocks, node_headers=headers,
+                    node_progress_pct=round(pct, 2), chain=chain)
+                stop_event.wait(10)
+                continue
+            print(f"[sync-thread] Node ready — chain={chain}, height={blocks}", flush=True)
+            write_status(db_path, state="node_ready",
+                         message="Bitcoin Core ready, starting block sync...",
+                         tip_height=blocks, chain=chain)
+            break
+        except requests.exceptions.ConnectionError:
+            print("[sync-thread] Node not reachable, retrying...", flush=True)
+            write_status(db_path, state="waiting_for_node",
+                         message="Waiting for Bitcoin Core node...")
+            stop_event.wait(3)
+        except Exception as e:
+            print(f"[sync-thread] Error: {e}, retrying...", flush=True)
+            stop_event.wait(3)
+
+    # Main sync loop — runs forever until stop_event
+    while not stop_event.is_set():
+        try:
+            _sync_once(con, write_lock, rpc, db_path, batch_size, stop_event)
+        except Exception as e:
+            print(f"[sync-thread] Sync error (will retry): {e}", flush=True)
+            write_status(db_path, state="error",
+                         message=f"Sync error: {e}")
+        # Wait before checking for new blocks
+        stop_event.wait(poll_interval)
+
+    print("[sync-thread] Stopped.", flush=True)
+
+
+def _sync_once(
+    con: duckdb.DuckDBPyConnection,
+    write_lock: threading.Lock,
+    rpc: BitcoinRPC,
+    db_path: str,
+    batch_size: int,
+    stop_event: threading.Event,
+):
+    """Sync from current DB height to chain tip (one pass)."""
+    with write_lock:
+        start_height = get_synced_height(con) + 1
+
+    tip_height = rpc.getblockcount()
+
+    if start_height > tip_height:
+        write_status(db_path, state="synced", message="Up to date",
+                     current_height=tip_height, tip_height=tip_height,
+                     progress_pct=100.0, blocks_per_sec=0)
+        return
+
+    total = tip_height - start_height + 1
+    print(f"[sync-thread] Syncing blocks {start_height:,} → {tip_height:,} "
+          f"({total:,} blocks)", flush=True)
+
+    sync_t0 = time.time()
+    blocks_done = 0
+    height = start_height
+
+    write_status(db_path, state="syncing",
+                 message=f"Starting sync of {total:,} blocks...",
+                 current_height=start_height, tip_height=tip_height,
+                 blocks_synced=0, total_blocks=total, progress_pct=0,
+                 blocks_per_sec=0, eta_sec=0)
+
+    while height <= tip_height and not stop_event.is_set():
+        chunk_end = min(height + batch_size, tip_height + 1)
+        chunk_heights = list(range(height, chunk_end))
+
+        # Fetch from RPC (no lock needed — purely network I/O)
+        hashes = rpc.batch_getblockhash(chunk_heights)
+        raw_blocks = rpc.batch_getblock(hashes, verbosity=2)
+
+        # Parse blocks (CPU-only, no lock needed)
+        block_buf, tx_buf, in_buf, out_buf = [], [], [], []
+        for block_json in raw_blocks:
+            block_row, txs, ins, outs = parse_rpc_block(block_json)
+            block_buf.append(block_row)
+            tx_buf.extend(txs)
+            in_buf.extend(ins)
+            out_buf.extend(outs)
+
+        # Write batch under the lock (brief — only the DB insert)
+        with write_lock:
+            flush_batch(con, block_buf, tx_buf, in_buf, out_buf)
+
+        # Update progress
+        blocks_done = height + len(chunk_heights) - start_height
+        elapsed = max(time.time() - sync_t0, 0.01)
+        bps = blocks_done / elapsed
+        remaining = total - blocks_done
+        eta_sec = remaining / bps if bps > 0 else 0
+        pct = (chunk_heights[-1] / tip_height * 100) if tip_height else 100
+        write_status(db_path,
+            state="syncing",
+            message=f"Syncing block {chunk_heights[-1]:,} of {tip_height:,}",
+            current_height=chunk_heights[-1],
+            start_height=start_height,
+            tip_height=tip_height,
+            blocks_synced=blocks_done,
+            blocks_remaining=remaining,
+            total_blocks=total,
+            progress_pct=round(pct, 2),
+            blocks_per_sec=round(bps, 1),
+            elapsed_sec=round(elapsed),
+            eta_sec=round(eta_sec))
+
+        height = chunk_end
+
+    if not stop_event.is_set():
+        with write_lock:
+            final = get_synced_height(con)
+        elapsed = max(time.time() - sync_t0, 0.01)
+        print(f"[sync-thread] Sync complete — height {final:,}, "
+              f"{total:,} blocks in {elapsed:.0f}s", flush=True)
+        write_status(db_path,
+            state="synced",
+            message=f"Synced to block {final:,}",
+            current_height=final, tip_height=tip_height,
+            progress_pct=100.0,
+            blocks_per_sec=round(total / elapsed, 1),
+            elapsed_sec=round(elapsed), eta_sec=0)
 
 
 # ---------------------------------------------------------------------------

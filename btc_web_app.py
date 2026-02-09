@@ -3,7 +3,16 @@
 Bitcoin Blockchain SQL Explorer - Web Application
 
 A modern, beautiful web-based SQL interface for exploring Bitcoin blockchain data.
+
+Architecture:  Gunicorn runs this module with --workers 1 --threads 4.
+Blockchain sync and mempool sync run as daemon threads inside this
+process, sharing a single DuckDB connection.  DuckDB's in-process MVCC
+allows concurrent readers + a single writer, eliminating file-lock
+contention entirely.
 """
+
+import atexit
+import threading
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 import duckdb
@@ -12,12 +21,14 @@ import pandas as pd
 import os
 import json
 import time
-import random
 from datetime import datetime
 import io
 import base64
 import plotly.graph_objects as go
 import plotly.express as px
+
+from btc_sync import ensure_schema, sync_thread as _blockchain_sync_thread
+from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
 
 app = Flask(__name__)
 
@@ -33,102 +44,98 @@ REACT_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), 'frontend',
 REACT_INDEX = os.path.join(REACT_DIST, 'index.html')
 
 DB_PATH = os.environ.get('DB_PATH', 'bitcoin_blockchain.db')
-MEMPOOL_DB_PATH = os.environ.get('MEMPOOL_DB_PATH',
-                                  os.path.join(os.path.dirname(os.environ.get('DB_PATH', 'bitcoin_blockchain.db')) or '.', 'mempool.db'))
 SAVED_QUERIES_PATH = os.environ.get('SAVED_QUERIES_PATH', 'saved_queries.db')
 
 
 # ---------------------------------------------------------------------------
-# Blockchain DB (DuckDB, read-only)
+# Persistent DuckDB connection (shared by sync threads + request handlers)
 # ---------------------------------------------------------------------------
 
-class DBBusy(Exception):
-    """Raised when the blockchain DB is locked by the sync process."""
-    pass
+# Single connection — DuckDB's in-process MVCC handles concurrent reads
+# while a writer holds the lock.  The write_lock serialises the two
+# sync threads so only one writes at a time.
+_db: duckdb.DuckDBPyConnection = duckdb.connect(DB_PATH)
+_write_lock = threading.Lock()
+_stop_event = threading.Event()
+
+# Ensure all tables (blockchain + mempool) exist
+with _write_lock:
+    ensure_schema(_db)
+
+print(f"[web] DuckDB connection open — {DB_PATH}", flush=True)
 
 
-_MEMPOOL_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS mempool_transactions (
-    txid VARCHAR NOT NULL, size BIGINT, vsize BIGINT, weight BIGINT,
-    fee BIGINT, modified_fee BIGINT, ancestor_count BIGINT,
-    ancestor_size BIGINT, ancestor_fees BIGINT, descendant_count BIGINT,
-    descendant_size BIGINT, descendant_fees BIGINT, time_entered BIGINT,
-    height_entered BIGINT, bip125_replaceable BOOLEAN,
-    depends VARCHAR[], spentby VARCHAR[], snapshot_time BIGINT
-);
-CREATE TABLE IF NOT EXISTS mempool_snapshots (
-    snapshot_time BIGINT NOT NULL, tx_count BIGINT, total_bytes BIGINT,
-    total_fee BIGINT, memory_usage BIGINT, max_mempool BIGINT,
-    min_fee_rate DOUBLE, min_relay_fee DOUBLE
-);
-"""
+def get_read_cursor():
+    """Return a DuckDB cursor for read-only queries.
 
-
-def _ensure_mempool_attached(con):
-    """Guarantee the ``mempool`` database exists on *con*.
-
-    Try to ATTACH the on-disk mempool DB.  If that fails for ANY reason
-    (file missing, write-locked by syncer, permissions, …) fall back to
-    an empty in-memory database so that ``mempool.mempool_transactions``
-    always resolves — worst case it returns zero rows instead of a
-    Catalog Error.
+    Cursors are lightweight and can run concurrently with the sync
+    writer within the same process (DuckDB MVCC).  Never returns None
+    or raises "database busy".
     """
-    attached = False
-    if os.path.exists(MEMPOOL_DB_PATH):
-        try:
-            con.execute(f"ATTACH '{MEMPOOL_DB_PATH}' AS mempool (READ_ONLY)")
-            attached = True
-        except Exception as exc:
-            print(f"[web] mempool ATTACH failed ({exc}), using in-memory fallback", flush=True)
-
-    if not attached:
-        # In-memory database named "mempool" with empty tables
-        con.execute("ATTACH ':memory:' AS mempool")
-        for stmt in _MEMPOOL_SCHEMA_SQL.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                con.execute(f"USE mempool; {stmt}")
-        con.execute("USE blockchain")  # restore default
+    return _db.cursor()
 
 
-def get_db_connection(retries=120, delay=0.05):
-    """Open a read-only DuckDB connection with retry on lock conflict.
+# ---------------------------------------------------------------------------
+# Start background sync threads
+# ---------------------------------------------------------------------------
 
-    Uses an in-memory hub connection with ATTACH so we can attach both
-    the blockchain DB and mempool DB.  The blockchain DB is set as the
-    default database (USE) so existing queries like
-    ``SELECT * FROM blocks`` keep working without a prefix.
+_RPC_URL = "http://{}:{}".format(
+    os.environ.get("BITCOIN_RPC_HOST", "127.0.0.1"),
+    os.environ.get("BITCOIN_RPC_PORT", "8332"),
+)
+_RPC_USER = os.environ.get("BITCOIN_RPC_USER", "bitcoin")
+_RPC_PASS = os.environ.get("BITCOIN_RPC_PASS", "bitcoin")
 
-    The mempool database is **always** available — either from the
-    on-disk file or as an empty in-memory fallback — so queries
-    referencing ``mempool.*`` never hit a Catalog Error.
+_sync_t = threading.Thread(
+    target=_blockchain_sync_thread,
+    kwargs=dict(
+        con=_db,
+        write_lock=_write_lock,
+        stop_event=_stop_event,
+        rpc_url=_RPC_URL,
+        rpc_user=_RPC_USER,
+        rpc_password=_RPC_PASS,
+        db_path=DB_PATH,
+        batch_size=50,
+        poll_interval=30,
+    ),
+    daemon=True,
+    name="blockchain-sync",
+)
+_sync_t.start()
+print("[web] Blockchain sync thread started", flush=True)
 
-    Returns a connection or None (DB missing). Raises DBBusy if
-    the lock cannot be acquired after all retries (~10 seconds).
-    """
-    if not os.path.exists(DB_PATH):
-        return None
-    for attempt in range(retries):
-        con = None
-        try:
-            con = duckdb.connect()  # lightweight in-memory connection
-            con.execute(f"ATTACH '{DB_PATH}' AS blockchain (READ_ONLY)")
-            con.execute("USE blockchain")  # default DB → blockchain tables need no prefix
-            _ensure_mempool_attached(con)
-            return con
-        except duckdb.IOException:
-            # Close the in-memory connection that failed to attach
-            if con is not None:
-                try:
-                    con.close()
-                except Exception:
-                    pass
-            if attempt < retries - 1:
-                # Jittered delay avoids phase-locking with the sync loop.
-                # Short base delay (50ms) with jitter so we poll rapidly
-                # and catch the gap between sync write batches.
-                time.sleep(delay * (0.5 + random.random()))
-    raise DBBusy("Database is temporarily busy (sync in progress). Please retry in a moment.")
+_mempool_t = threading.Thread(
+    target=_mempool_sync_thread,
+    kwargs=dict(
+        con=_db,
+        write_lock=_write_lock,
+        stop_event=_stop_event,
+        rpc_url=_RPC_URL,
+        rpc_user=_RPC_USER,
+        rpc_password=_RPC_PASS,
+        db_path=DB_PATH,
+        interval=15,
+    ),
+    daemon=True,
+    name="mempool-sync",
+)
+_mempool_t.start()
+print("[web] Mempool sync thread started", flush=True)
+
+
+def _shutdown():
+    """Signal sync threads to stop and close the DuckDB connection."""
+    print("[web] Shutting down sync threads...", flush=True)
+    _stop_event.set()
+    _sync_t.join(timeout=5)
+    _mempool_t.join(timeout=5)
+    try:
+        _db.close()
+    except Exception:
+        pass
+
+atexit.register(_shutdown)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +175,6 @@ def index():
 @app.route('/api/execute', methods=['POST'])
 def execute_query():
     """Execute SQL query and return results"""
-    con = None
     try:
         data = request.get_json()
         query = data.get('query', '').strip()
@@ -176,13 +182,11 @@ def execute_query():
         if not query:
             return jsonify({'error': 'No query provided'}), 400
         
-        con = get_db_connection()
-        if con is None:
-            return jsonify({'error': 'Database is initializing. The sync process is starting — please wait a moment and refresh.'}), 503
+        cur = get_read_cursor()
         
         # Execute query
         start_time = datetime.now()
-        result = con.execute(query).fetchdf()
+        result = cur.execute(query).fetchdf()
         execution_time = (datetime.now() - start_time).total_seconds()
         
         # Convert to JSON-serializable format
@@ -223,15 +227,11 @@ def execute_query():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        if con:
-            try: con.close()
-            except Exception: pass
 
 @app.route('/api/sync-status')
 def sync_status():
     """Return detailed sync progress so the UI can show a progress screen."""
-    # Read the status file written by btc_sync.py
+    # Read the status file written by the sync thread
     status_file = os.path.join(os.path.dirname(DB_PATH) or ".", "sync_status.json")
     file_status = {}
     try:
@@ -244,18 +244,12 @@ def sync_status():
     # Also get the DB row count (the file_status might be stale)
     db_blocks = 0
     db_last_block = None
-    con = None
     try:
-        con = get_db_connection()
-        if con is not None:
-            db_blocks = con.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
-            db_last_block = con.execute("SELECT MAX(number) FROM blocks").fetchone()[0]
+        cur = get_read_cursor()
+        db_blocks = cur.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+        db_last_block = cur.execute("SELECT MAX(number) FROM blocks").fetchone()[0]
     except Exception:
         pass
-    finally:
-        if con:
-            try: con.close()
-            except Exception: pass
 
     state = file_status.get("state", "unknown")
     tip = file_status.get("tip_height") or file_status.get("node_headers") or 0
@@ -301,25 +295,16 @@ def sync_status():
 
 @app.route('/api/schema')
 def get_schema():
-    """Get database schema (blockchain + mempool if available)"""
-    con = None
+    """Get database schema (all tables in the unified database)"""
     try:
-        con = get_db_connection()
-        if con is None:
-            return jsonify({'error': 'Database is initializing. Please wait a moment and refresh.'}), 503
+        cur = get_read_cursor()
         
-        # Blockchain tables (USE blockchain is already set)
-        schema_query = """
-        SELECT 
-            table_name,
-            column_name,
-            data_type
-        FROM blockchain.information_schema.columns 
-        WHERE table_schema = 'main'
-        ORDER BY table_name, ordinal_position
-        """
-        
-        result = con.execute(schema_query).fetchdf()
+        result = cur.execute("""
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'main'
+            ORDER BY table_name, ordinal_position
+        """).fetchdf()
         
         # Group by table
         schema = {}
@@ -331,44 +316,17 @@ def get_schema():
                 'column': row['column_name'],
                 'type': row['data_type']
             })
-
-        # Mempool tables (if ATTACH succeeded)
-        try:
-            mp_result = con.execute("""
-                SELECT table_name, column_name, data_type
-                FROM mempool.information_schema.columns
-                WHERE table_schema = 'main'
-                ORDER BY table_name, ordinal_position
-            """).fetchdf()
-            for _, row in mp_result.iterrows():
-                # Prefix with mempool. so users know the full path
-                table_name = "mempool." + row['table_name']
-                if table_name not in schema:
-                    schema[table_name] = []
-                schema[table_name].append({
-                    'column': row['column_name'],
-                    'type': row['data_type']
-                })
-        except Exception:
-            pass  # mempool DB not attached — that's fine
         
         return jsonify({'success': True, 'schema': schema})
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        if con:
-            try: con.close()
-            except Exception: pass
 
 @app.route('/api/stats')
 def get_stats():
     """Get database statistics"""
-    con = None
     try:
-        con = get_db_connection()
-        if con is None:
-            return jsonify({'error': 'Database is initializing. Please wait a moment and refresh.'}), 503
+        cur = get_read_cursor()
         
         stats_query = """
         SELECT 
@@ -380,7 +338,7 @@ def get_stats():
             (SELECT MAX(number) FROM blocks) as last_block
         """
         
-        result = con.execute(stats_query).fetchdf()
+        result = cur.execute(stats_query).fetchdf()
         stats = result.iloc[0]
         
         return jsonify({
@@ -397,10 +355,6 @@ def get_stats():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        if con:
-            try: con.close()
-            except Exception: pass
 
 @app.route('/api/export', methods=['POST'])
 def export_results():
@@ -1127,7 +1081,7 @@ SELECT
     MIN(time_entered) AS oldest_entry_unix,
     ROUND((EXTRACT(EPOCH FROM NOW()) - MIN(time_entered)) / 60.0, 1) AS oldest_waiting_min,
     COUNT(CASE WHEN bip125_replaceable THEN 1 END) AS rbf_eligible_count
-FROM mempool.mempool_transactions"""
+FROM mempool_transactions"""
                 },
                 "Fee Rate Distribution": {
                     "description": "Histogram of fee rates — see where your transaction sits in the queue",
@@ -1146,7 +1100,7 @@ WITH fee_buckets AS (
         END AS fee_bucket,
         fee,
         vsize
-    FROM mempool.mempool_transactions
+    FROM mempool_transactions
 )
 SELECT
     fee_bucket,
@@ -1178,7 +1132,7 @@ SELECT
     ROUND(total_fee / 100000000.0, 4) AS total_fee_btc,
     ROUND(memory_usage / 1000000.0, 2) AS memory_mb,
     min_fee_rate AS min_fee_btc_kvb
-FROM mempool.mempool_snapshots
+FROM mempool_snapshots
 ORDER BY snapshot_time DESC
 LIMIT 100"""
                 },
@@ -1196,7 +1150,7 @@ SELECT
     descendant_size,
     ROUND(descendant_fees * 1.0 / NULLIF(descendant_size, 0), 2) AS descendant_fee_rate,
     ROUND(fee / 100000000.0, 8) AS fee_btc
-FROM mempool.mempool_transactions
+FROM mempool_transactions
 WHERE ancestor_count > 1 OR descendant_count > 1
 ORDER BY ancestor_count + descendant_count DESC
 LIMIT 50"""
@@ -1213,7 +1167,7 @@ SELECT
     ROUND((EXTRACT(EPOCH FROM NOW()) - time_entered) / 60.0, 1) AS waiting_minutes,
     ancestor_count,
     descendant_count
-FROM mempool.mempool_transactions
+FROM mempool_transactions
 WHERE bip125_replaceable = true
 ORDER BY fee_rate_sat_vb ASC
 LIMIT 50"""
@@ -1231,7 +1185,7 @@ SELECT
     bip125_replaceable AS rbf,
     ancestor_count,
     descendant_count
-FROM mempool.mempool_transactions
+FROM mempool_transactions
 ORDER BY time_entered ASC
 LIMIT 30"""
                 }
@@ -1405,22 +1359,14 @@ if os.path.isfile(os.path.join(REACT_DIST, 'index.html')):
 
 
 if __name__ == '__main__':
-    has_db = os.path.exists('bitcoin_blockchain.db')
-    if not has_db:
-        print("Database 'bitcoin_blockchain.db' not found.")
-        print("  To set up with a live testnet4 node:")
-        print("    1. docker compose up -d")
-        print("    2. python btc_sync.py")
-        print("  Or for legacy Parquet import:")
-        print("    python btc_duckdb_setup.py")
-        print("  The UI will load but queries will fail until the database exists.\n")
-    else:
-        print("Database: bitcoin_blockchain.db")
+    print(f"Database: {DB_PATH}")
     if os.path.isfile(REACT_INDEX):
         print("Serving React UI (frontend/dist)")
     else:
-        print("Serving legacy UI (templates). Run: cd frontend && npm run build")
+        print("Frontend not built. Run: cd frontend && npm run build")
     print("Bitcoin Blockchain SQL Explorer")
     print("http://localhost:5001")
     print("Press Ctrl+C to stop")
-    app.run(debug=True, host='0.0.0.0', port=5001) 
+    # debug=False because debug mode uses a reloader that forks a second
+    # process, which would start duplicate sync threads.
+    app.run(debug=False, host='0.0.0.0', port=5001)

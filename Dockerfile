@@ -41,7 +41,6 @@ VOLUME /data
 
 # Default environment (overridden by Umbrel docker-compose)
 ENV DB_PATH=/data/bitcoin_blockchain.db \
-    MEMPOOL_DB_PATH=/data/mempool.db \
     SAVED_QUERIES_PATH=/data/saved_queries.db \
     BITCOIN_RPC_HOST=127.0.0.1 \
     BITCOIN_RPC_PORT=8332 \

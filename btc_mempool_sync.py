@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -349,6 +350,91 @@ def poll_loop(rpc: BitcoinRPC, db_path: str, interval: int):
         sleep_time = max(0, interval - (time.time() - t0))
         if sleep_time > 0:
             time.sleep(sleep_time)
+
+
+# ---------------------------------------------------------------------------
+# Thread entry point (used by btc_web_app.py for in-process sync)
+# ---------------------------------------------------------------------------
+
+def mempool_sync_thread(
+    con: duckdb.DuckDBPyConnection,
+    write_lock: threading.Lock,
+    stop_event: threading.Event,
+    rpc_url: str,
+    rpc_user: str,
+    rpc_password: str,
+    db_path: str,
+    interval: int = 15,
+):
+    """Run mempool sync in a background thread.
+
+    Uses *con* (a shared DuckDB connection) for all writes, acquiring
+    *write_lock* for each refresh so blockchain writes and reader
+    cursors are never blocked for long.  Loops every *interval* seconds
+    until *stop_event* is set.
+    """
+    rpc = BitcoinRPC(rpc_url, rpc_user, rpc_password)
+    status_dir = os.path.dirname(db_path) or "."
+    status_file = os.path.join(status_dir, "mempool_status.json")
+
+    print(f"[mempool-thread] Polling every {interval}s", flush=True)
+    cycle = 0
+
+    while not stop_event.is_set():
+        t0 = time.time()
+        try:
+            raw = rpc.getrawmempool(verbose=True)
+            info = rpc.getmempoolinfo()
+            snapshot_ts = int(time.time())
+
+            tx_rows = parse_mempool(raw, snapshot_ts)
+            snapshot_row = parse_mempoolinfo(info, snapshot_ts)
+
+            # Write under the shared lock (brief)
+            with write_lock:
+                refresh_mempool(con, tx_rows, snapshot_row)
+
+            elapsed = time.time() - t0
+            cycle += 1
+
+            if cycle % 4 == 1:
+                print(f"[mempool-thread] {len(tx_rows)} txs, "
+                      f"fees={snapshot_row['total_fee'] / 1e8:.4f} BTC, "
+                      f"took {elapsed:.1f}s", flush=True)
+
+            _write_mempool_status(status_file,
+                state="running",
+                message=f"{len(tx_rows)} unconfirmed transactions",
+                tx_count=len(tx_rows),
+                total_bytes=snapshot_row["total_bytes"],
+                total_fee_sat=snapshot_row["total_fee"],
+                min_fee_rate=snapshot_row["min_fee_rate"],
+                cycle=cycle,
+                last_refresh_ms=round(elapsed * 1000))
+
+        except Exception as e:
+            print(f"[mempool-thread] Error: {e}", flush=True)
+            _write_mempool_status(status_file,
+                state="error", message=str(e))
+
+        # Sleep until next cycle (interruptible)
+        sleep_time = max(0, interval - (time.time() - t0))
+        if sleep_time > 0:
+            stop_event.wait(sleep_time)
+
+    print("[mempool-thread] Stopped.", flush=True)
+
+
+def _write_mempool_status(path: str, **fields):
+    """Atomically write mempool status JSON."""
+    fields.setdefault("updated_at", datetime.utcnow().isoformat() + "Z")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(fields, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
