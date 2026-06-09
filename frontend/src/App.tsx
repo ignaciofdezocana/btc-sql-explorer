@@ -62,13 +62,27 @@ function formatEta(seconds: number): string {
   return '<1m';
 }
 
+function formatTxRate(txPerSec: number): string {
+  if (txPerSec >= 1_000_000) return `${(txPerSec / 1_000_000).toFixed(1)}M tx/s`;
+  if (txPerSec >= 1_000) return `${(txPerSec / 1_000).toFixed(1)}K tx/s`;
+  return `${Math.round(txPerSec)} tx/s`;
+}
+
 function SyncBanner({ status }: { status: SyncStatus }) {
   const state = status.state;
   let text = status.message || 'Syncing...';
   if (state === 'syncing') {
-    text = `Syncing: block ${status.current_height?.toLocaleString()} of ${status.tip_height?.toLocaleString()} (${status.progress_pct?.toFixed(1)}%)`;
-    if (status.blocks_per_sec > 0) text += ` \u00b7 ${status.blocks_per_sec} blk/s`;
-    if (status.eta_sec > 0) text += ` \u00b7 ${formatEta(status.eta_sec)} left`;
+    // Show block-based percentage (matches the block numbers the user sees)
+    // but use tx-weighted ETA which is more accurate for time remaining
+    const blockPct = status.progress_pct;
+    const eta = (status.tx_eta_sec > 0) ? status.tx_eta_sec : status.eta_sec;
+    text = `Syncing: block ${status.current_height?.toLocaleString()} of ${status.tip_height?.toLocaleString()} (${blockPct?.toFixed(1)}%)`;
+    if (status.tx_per_sec > 0) {
+      text += ` \u00b7 ${formatTxRate(status.tx_per_sec)}`;
+    } else if (status.blocks_per_sec > 0) {
+      text += ` \u00b7 ${status.blocks_per_sec} blk/s`;
+    }
+    if (eta > 0) text += ` \u00b7 ${formatEta(eta)} left`;
   } else if (state === 'node_ibd') {
     text = `Bitcoin Core is syncing the blockchain (${(status.node_progress_pct ?? 0).toFixed(1)}%)`;
   } else if (state === 'waiting_for_node') {
@@ -372,6 +386,13 @@ export default function App() {
           <button type="button" className="topbar-btn" onClick={showSchema}>
             Schema
           </button>
+          <a
+            className="topbar-btn"
+            href="/api/logs/download"
+            title="Download a diagnostics bundle (logs + system snapshot) to share when the sync gets stuck"
+          >
+            Diagnostics
+          </a>
         </div>
       </div>
 

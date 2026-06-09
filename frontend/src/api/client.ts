@@ -27,6 +27,11 @@ export type SyncStatus = {
   blocks_per_sec: number;
   eta_sec: number;
   elapsed_sec: number;
+  // Transaction-weighted progress (more accurate than block-based)
+  tx_progress_pct: number;
+  tx_per_sec: number;
+  tx_eta_sec: number;
+  tx_synced: number;
   node_progress_pct: number | null;
   node_blocks: number | null;
   node_headers: number | null;

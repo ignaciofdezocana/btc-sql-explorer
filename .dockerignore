@@ -2,6 +2,11 @@
 frontend/node_modules/
 frontend/dist/
 
+# Local Python environments (not needed in image)
+.venv/
+.conda/
+.DS_Store
+
 # Local databases
 *.db
 

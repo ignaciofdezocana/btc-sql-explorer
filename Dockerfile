@@ -26,7 +26,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
 # Application code
-COPY btc_web_app.py btc_sync.py btc_mempool_sync.py ./
+COPY btc_web_app.py btc_sync.py btc_mempool_sync.py logging_setup.py gunicorn.conf.py ./
 
 # Built React frontend from stage 1
 COPY --from=frontend-build /build/dist/ frontend/dist/

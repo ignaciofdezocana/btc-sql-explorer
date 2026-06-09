@@ -12,7 +12,9 @@ contention entirely.
 """
 
 import atexit
+import logging
 import threading
+import zipfile
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 import duckdb
@@ -27,8 +29,23 @@ import base64
 import plotly.graph_objects as go
 import plotly.express as px
 
-from btc_sync import ensure_schema, sync_thread as _blockchain_sync_thread
+from logging_setup import setup_logging, resource_snapshot
+from btc_sync import ensure_schema, validate_schema, sync_thread as _blockchain_sync_thread
 from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
+
+# Configure logging FIRST (timestamped, to stdout + rotating /data/logs file)
+# so every line below — including sync-thread output — is captured.
+setup_logging()
+log = logging.getLogger("web")
+
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.5")
+LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
+
+
+def _i(x):
+    """Format a possibly-None number for a log line."""
+    return "?" if x is None else f"{x:.0f}"
+
 
 app = Flask(__name__)
 
@@ -51,18 +68,72 @@ SAVED_QUERIES_PATH = os.environ.get('SAVED_QUERIES_PATH', 'saved_queries.db')
 # Persistent DuckDB connection (shared by sync threads + request handlers)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Startup banner + environment sanity (logged so it's in the downloadable file)
+# ---------------------------------------------------------------------------
+
+def _check_writable(dir_path: str) -> bool:
+    """Probe whether the data dir is actually writable (catches the old
+    read-only /data permission bug at boot instead of via a write-error cascade)."""
+    probe = os.path.join(dir_path, ".write_probe")
+    try:
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception as e:
+        log.error("DATA_DIR_NOT_WRITABLE dir=%s err=%s — every DB write will fail", dir_path, e)
+        return False
+
+
+log.info("==== BTC SQL Explorer starting ====")
+log.info("version=%s pid=%s duckdb=%s log_level=%s",
+         APP_VERSION, os.getpid(), duckdb.__version__, os.environ.get("LOG_LEVEL", "INFO"))
+log.info("config: rpc_host=%s rpc_port=%s rpc_user=%s rpc_pass=*** db_path=%s saved_queries=%s",
+         os.environ.get("BITCOIN_RPC_HOST"), os.environ.get("BITCOIN_RPC_PORT"),
+         os.environ.get("BITCOIN_RPC_USER"), DB_PATH, SAVED_QUERIES_PATH)
+_snap = resource_snapshot(DB_PATH)
+# The single most expensive past mistake was misjudging available RAM — log it plainly.
+log.info("memory: host=%sMB container_cap=%sMB duckdb_limit=1536MB",
+         _i(_snap["sys_total_mb"]), _i(_snap["cgroup_limit_mb"]))
+log.info("disk: data_dir free=%sMB | db=%sMB wal=%sMB",
+         _i(_snap["disk_free_mb"]), _i(_snap["db_mb"]), _i(_snap["wal_mb"]))
+_check_writable(os.path.dirname(DB_PATH) or ".")
+
 # Single connection — DuckDB's in-process MVCC handles concurrent reads
 # while a writer holds the lock.  The write_lock serialises the two
 # sync threads so only one writes at a time.
 _db: duckdb.DuckDBPyConnection = duckdb.connect(DB_PATH)
+_db.execute("SET memory_limit = '1536MB'")                # explicit cap — prevents OOM on 16 GB devices
+_db.execute("SET preserve_insertion_order = false")       # lower memory during bulk inserts
+_db.execute("SET threads = 2")                            # less memory pressure; leave cores for OS/Bitcoin Core
 _write_lock = threading.Lock()
 _stop_event = threading.Event()
+_blockchain_synced = threading.Event()  # set once blockchain reaches chain tip
 
-# Ensure all tables (blockchain + mempool) exist
+# Shared, lock-free-enough state the heartbeat thread reads to report liveness.
+_sync_state = {
+    "phase": "starting",
+    "height": 0,
+    "tip": 0,
+    "pct": 0.0,
+    "last_flush_time": time.time(),
+}
+
+# Ensure all tables (blockchain + mempool) exist, then validate the layout.
 with _write_lock:
     ensure_schema(_db)
+    validate_schema(_db)         # logs SCHEMA_MISMATCH if a pre-existing DB drifted
 
-print(f"[web] DuckDB connection open — {DB_PATH}", flush=True)
+# Log the DuckDB settings that actually took effect (confirm they applied).
+for _s in ("memory_limit", "threads", "preserve_insertion_order", "wal_autocheckpoint"):
+    try:
+        _v = _db.execute(f"SELECT current_setting('{_s}')").fetchone()[0]
+        log.info("duckdb setting %s=%s", _s, _v)
+    except Exception:
+        pass
+
+log.info("DuckDB connection open — %s", DB_PATH)
 
 
 def get_read_cursor():
@@ -86,24 +157,81 @@ _RPC_URL = "http://{}:{}".format(
 _RPC_USER = os.environ.get("BITCOIN_RPC_USER", "bitcoin")
 _RPC_PASS = os.environ.get("BITCOIN_RPC_PASS", "bitcoin")
 
+# ---------------------------------------------------------------------------
+# Heartbeat / resource monitor — the OOM smoking gun.
+# Emits one liveness line every HEARTBEAT_SEC with memory/disk/WAL/phase so the
+# last lines before a kill survive in the file and point at the cause.
+# ---------------------------------------------------------------------------
+
+_HEARTBEAT_SEC = int(os.environ.get("HEARTBEAT_SEC", "15"))
+_WAL_WARN_MB = float(os.environ.get("WAL_WARN_MB", "512"))          # 2x the 256MB autocheckpoint
+_BLOAT_WARN_MB_PER_1K = float(os.environ.get("DB_BLOAT_WARN_MB_PER_1K", "100"))
+
+
+def _heartbeat_loop():
+    hb = logging.getLogger("heartbeat")
+    while not _stop_event.wait(_HEARTBEAT_SEC):
+        try:
+            snap = resource_snapshot(DB_PATH)
+            used, lim = snap["cgroup_used_mb"], snap["cgroup_limit_mb"]
+            pct_mem = (used / lim * 100) if (used and lim) else None
+            height = _sync_state.get("height") or 0
+            tip = _sync_state.get("tip") or 0
+            db_mb = snap["db_mb"] or 0
+            wal_mb = snap["wal_mb"]
+            per1k = (db_mb / height * 1000) if height else None
+            age = time.time() - _sync_state.get("last_flush_time", time.time())
+
+            hb.info("phase=%s height=%s tip=%s pct=%.1f rss_mb=%s cgroup_mem_mb=%s/%s (%s%%) "
+                    "sys_avail_mb=%s db_mb=%s wal_mb=%s disk_free_mb=%s threads=%d "
+                    "last_flush_age_s=%.0f db_mb_per_1k=%s",
+                    _sync_state.get("phase"), f"{height:,}", f"{tip:,}",
+                    _sync_state.get("pct") or 0.0,
+                    _i(snap["rss_mb"]), _i(used), _i(lim),
+                    (f"{pct_mem:.1f}" if pct_mem is not None else "?"),
+                    _i(snap["sys_avail_mb"]), _i(db_mb), _i(wal_mb),
+                    _i(snap["disk_free_mb"]), threading.active_count(), age,
+                    (f"{per1k:.0f}" if per1k else "?"))
+
+            if pct_mem is not None and pct_mem >= 90:
+                hb.warning("MEMORY_CRITICAL cgroup at %.1f%% of cap (%s/%sMB) — OOM kill imminent",
+                           pct_mem, _i(used), _i(lim))
+            elif pct_mem is not None and pct_mem >= 80:
+                hb.warning("MEMORY_HIGH cgroup at %.1f%% of cap (%s/%sMB)", pct_mem, _i(used), _i(lim))
+            if wal_mb and wal_mb > _WAL_WARN_MB:
+                hb.warning("WAL_NOT_CHECKPOINTING wal=%sMB exceeds %sMB — checkpointing may have "
+                           "stopped (v1.7.x OOM signature)", _i(wal_mb), _i(_WAL_WARN_MB))
+            if per1k and per1k > _BLOAT_WARN_MB_PER_1K:
+                hb.warning("DB_BLOAT %.0fMB/1k blocks (> %s) — possible rollback bloat "
+                           "(v1.8.0 47GB signature)", per1k, _i(_BLOAT_WARN_MB_PER_1K))
+        except Exception:
+            hb.exception("heartbeat error")
+
+
+_hb_t = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")
+_hb_t.start()
+log.info("heartbeat thread started (every %ds)", _HEARTBEAT_SEC)
+
 _sync_t = threading.Thread(
     target=_blockchain_sync_thread,
     kwargs=dict(
         con=_db,
         write_lock=_write_lock,
         stop_event=_stop_event,
+        blockchain_synced=_blockchain_synced,
         rpc_url=_RPC_URL,
         rpc_user=_RPC_USER,
         rpc_password=_RPC_PASS,
         db_path=DB_PATH,
-        batch_size=50,
+        batch_size=200,
         poll_interval=30,
+        state=_sync_state,
     ),
     daemon=True,
     name="blockchain-sync",
 )
 _sync_t.start()
-print("[web] Blockchain sync thread started", flush=True)
+log.info("blockchain sync thread started")
 
 _mempool_t = threading.Thread(
     target=_mempool_sync_thread,
@@ -111,6 +239,7 @@ _mempool_t = threading.Thread(
         con=_db,
         write_lock=_write_lock,
         stop_event=_stop_event,
+        blockchain_synced=_blockchain_synced,
         rpc_url=_RPC_URL,
         rpc_user=_RPC_USER,
         rpc_password=_RPC_PASS,
@@ -121,19 +250,26 @@ _mempool_t = threading.Thread(
     name="mempool-sync",
 )
 _mempool_t.start()
-print("[web] Mempool sync thread started", flush=True)
+log.info("mempool sync thread started")
 
 
 def _shutdown():
-    """Signal sync threads to stop and close the DuckDB connection."""
-    print("[web] Shutting down sync threads...", flush=True)
+    """Signal sync threads to stop and close the DuckDB connection.
+
+    The presence of this line in the logs is the key OOM tell: if the log just
+    stops mid-operation with NO 'shutting down' line and then a fresh boot
+    appears, the process was SIGKILLed (kernel OOM), not stopped gracefully.
+    """
+    log.info("shutting down — stop_event set, joining sync threads")
     _stop_event.set()
     _sync_t.join(timeout=5)
     _mempool_t.join(timeout=5)
+    _hb_t.join(timeout=2)
     try:
         _db.close()
     except Exception:
         pass
+    log.info("shutdown complete")
 
 atexit.register(_shutdown)
 
@@ -183,12 +319,15 @@ def execute_query():
             return jsonify({'error': 'No query provided'}), 400
         
         cur = get_read_cursor()
-        
+
         # Execute query
         start_time = datetime.now()
         result = cur.execute(query).fetchdf()
         execution_time = (datetime.now() - start_time).total_seconds()
-        
+        if execution_time > 10:
+            log.warning("SLOW_QUERY %.1fs rows=%d sql=%s",
+                        execution_time, len(result), query[:200].replace("\n", " "))
+
         # Convert to JSON-serializable format
         if result.empty:
             return jsonify({
@@ -224,8 +363,10 @@ def execute_query():
             'execution_time': execution_time,
             'message': 'Query executed successfully'
         })
-        
+
     except Exception as e:
+        log.warning("query error: %s | sql=%s", e,
+                    (request.get_json(silent=True) or {}).get('query', '')[:200].replace("\n", " "))
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/sync-status')
@@ -275,6 +416,11 @@ def sync_status():
         "blocks_per_sec": file_status.get("blocks_per_sec", 0),
         "eta_sec": file_status.get("eta_sec", 0),
         "elapsed_sec": file_status.get("elapsed_sec", 0),
+        # Transaction-weighted progress (more accurate than block-based)
+        "tx_progress_pct": file_status.get("tx_progress_pct", 0),
+        "tx_per_sec": file_status.get("tx_per_sec", 0),
+        "tx_eta_sec": file_status.get("tx_eta_sec", 0),
+        "tx_synced": file_status.get("tx_synced", 0),
         # Node IBD info (when applicable)
         "node_progress_pct": file_status.get("node_progress_pct"),
         "node_blocks": file_status.get("node_blocks"),
@@ -1346,6 +1492,79 @@ def delete_saved_query(query_id):
         if con:
             try: con.close()
             except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics bundle — one click to download everything a model needs
+# ---------------------------------------------------------------------------
+
+def _tail_log(n: int = 200) -> str:
+    path = os.path.join(LOG_DIR, "sync.log")
+    try:
+        with open(path, "r", errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except Exception as e:
+        return f"(could not read {path}: {e})\n"
+
+
+def _system_snapshot_text() -> str:
+    lines = ["BTC SQL Explorer — diagnostics snapshot",
+             f"version={APP_VERSION} duckdb={duckdb.__version__} pid={os.getpid()}",
+             f"generated_at={datetime.utcnow().isoformat()}Z",
+             "--- resources ---"]
+    for k, v in resource_snapshot(DB_PATH).items():
+        lines.append(f"{k}={'?' if v is None else round(v, 1)}")
+    lines.append("--- sync_state ---")
+    for k, v in _sync_state.items():
+        lines.append(f"{k}={v}")
+    lines.append("--- duckdb settings ---")
+    try:
+        cur = get_read_cursor()
+        for s in ("memory_limit", "threads", "preserve_insertion_order", "wal_autocheckpoint"):
+            try:
+                val = cur.execute("SELECT current_setting(?)", (s,)).fetchone()[0]
+                lines.append(f"{s}={val}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(LOG_DIR, "boot_count")) as f:
+            lines.append(f"boot_count={f.read().strip()}")
+    except Exception:
+        pass
+    return "\n".join(lines) + "\n"
+
+
+@app.route('/api/logs/download')
+def download_logs():
+    """Stream a zip of logs + status files + a fresh system snapshot."""
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            if os.path.isdir(LOG_DIR):
+                for fn in sorted(os.listdir(LOG_DIR)):
+                    if fn.startswith("sync.log") or fn in ("boot.log", "boot_count"):
+                        try:
+                            z.write(os.path.join(LOG_DIR, fn), arcname=f"logs/{fn}")
+                        except Exception:
+                            pass
+            data_dir = os.path.dirname(DB_PATH) or "."
+            for sf in ("sync_status.json", "mempool_status.json"):
+                p = os.path.join(data_dir, sf)
+                if os.path.isfile(p):
+                    try:
+                        z.write(p, arcname=sf)
+                    except Exception:
+                        pass
+            z.writestr("system_snapshot.txt", _system_snapshot_text())
+            z.writestr("tail.txt", _tail_log(200))
+        buf.seek(0)
+        return send_file(buf, mimetype="application/zip", as_attachment=True,
+                         download_name="btc-sql-explorer-diagnostics.zip")
+    except Exception as e:
+        log.exception("log download failed")
+        return jsonify({"error": str(e)}), 500
 
 
 # Serve React SPA static files (JS/CSS/images) when the build exists

@@ -14,16 +14,111 @@ Usage:
 """
 
 import argparse
+import collections
 import json
+import logging
 import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import duckdb
+import pandas as pd
 import requests
 from tqdm import tqdm
+
+# Resource readings for flush-time memory logging (graceful no-op fallback so
+# this module still imports if run outside the app image).
+try:
+    from logging_setup import proc_rss_mb, cgroup_mem, file_size_mb, log_exc
+except Exception:                                       # pragma: no cover
+    def proc_rss_mb():
+        return None
+
+    def cgroup_mem():
+        return (None, None)
+
+    def file_size_mb(path):
+        try:
+            return os.path.getsize(path) / (1024 * 1024)
+        except Exception:
+            return None
+
+    def log_exc(logger, msg, *args):
+        logger.error(msg, *args, exc_info=True)
+
+_log = logging.getLogger("btc_sync")
+
+# Tunable thresholds (overridable via env) used purely for log severity.
+_RPC_SLOW_MS = float(os.environ.get("RPC_SLOW_MS", "5000"))
+_RPC_BIG_RESP_MB = float(os.environ.get("RPC_BIG_RESP_MB", "50"))
+_FETCH_MAX_ATTEMPTS = int(os.environ.get("FETCH_MAX_ATTEMPTS", "4"))
+_FLUSH_SLOW_MS = float(os.environ.get("FLUSH_SLOW_MS", "5000"))
+_LOCK_SLOW_MS = float(os.environ.get("LOCK_SLOW_MS", "2000"))
+_CKPT_SLOW_MS = float(os.environ.get("CHECKPOINT_SLOW_MS", "10000"))
+_NODE_HEALTH_EVERY_N_BATCHES = int(os.environ.get("NODE_HEALTH_EVERY_N_BATCHES", "50"))
+
+
+def _mem_str():
+    """Compact 'rss=... cgroup=used/limit' string for log lines."""
+    rss = proc_rss_mb()
+    used, limit = cgroup_mem()
+    rss_s = f"{rss:.0f}" if rss is not None else "?"
+    used_s = f"{used:.0f}" if used is not None else "?"
+    lim_s = f"{limit:.0f}" if limit is not None else "?"
+    return f"rss_mb={rss_s} cgroup_mb={used_s}/{lim_s}"
+
+
+def _set_state(state, **kw):
+    """Update the shared sync-state dict read by the heartbeat thread."""
+    if state is not None:
+        state.update(kw)
+
+
+# ---------------------------------------------------------------------------
+# Transaction-weight lookup table for progress estimation
+# ---------------------------------------------------------------------------
+# Approximate cumulative transaction counts at key Bitcoin mainnet block
+# heights.  Used to give users a realistic, near-linear progress bar
+# instead of a block-count-based one (which is misleading because early
+# blocks are tiny and later blocks are huge).
+
+_TX_CUMULATIVE = [
+    (0,         1),
+    (100_000,   2_500_000),
+    (200_000,   30_000_000),
+    (300_000,   80_000_000),
+    (400_000,   145_000_000),
+    (500_000,   320_000_000),
+    (600_000,   530_000_000),
+    (700_000,   720_000_000),
+    (800_000,   910_000_000),
+    (900_000,   1_050_000_000),
+    (936_000,   1_100_000_000),
+]
+
+
+def estimate_cumulative_tx(height: int) -> int:
+    """Linearly interpolate cumulative tx count for a given block height."""
+    if height <= 0:
+        return 0
+    # Clamp to table range
+    if height >= _TX_CUMULATIVE[-1][0]:
+        # Extrapolate linearly from last two points
+        h1, t1 = _TX_CUMULATIVE[-2]
+        h2, t2 = _TX_CUMULATIVE[-1]
+        rate = (t2 - t1) / max(h2 - h1, 1)
+        return int(t2 + rate * (height - h2))
+    # Find surrounding points and interpolate
+    for i in range(1, len(_TX_CUMULATIVE)):
+        h_hi, t_hi = _TX_CUMULATIVE[i]
+        if height <= h_hi:
+            h_lo, t_lo = _TX_CUMULATIVE[i - 1]
+            frac = (height - h_lo) / max(h_hi - h_lo, 1)
+            return int(t_lo + frac * (t_hi - t_lo))
+    return _TX_CUMULATIVE[-1][1]
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +155,7 @@ class BitcoinRPC:
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
         self._id = 0
+        self.last_resp_bytes = 0          # size of the most recent response (for fetch logging)
 
     def _next_id(self):
         self._id += 1
@@ -72,11 +168,24 @@ class BitcoinRPC:
             "method": method,
             "params": params or [],
         }
-        resp = self.session.post(self.url, json=payload, auth=self.auth, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
+        t0 = time.time()
+        try:
+            resp = self.session.post(self.url, json=payload, auth=self.auth, timeout=120)
+            resp.raise_for_status()
+            n_bytes = len(resp.content)          # capture BEFORE json() in case parsing OOMs
+            self.last_resp_bytes = n_bytes
+            data = resp.json()
+        except Exception as e:
+            _log.error("RPC transport error method=%s url=%s err=%s", method, self.url, e)
+            raise
+        latency_ms = (time.time() - t0) * 1000
         if data.get("error"):
+            _log.error("RPC method=%s returned error=%s", method, data["error"])
             raise RuntimeError(f"RPC error: {data['error']}")
+        if latency_ms > _RPC_SLOW_MS:
+            _log.warning("RPC SLOW method=%s latency_ms=%.0f resp_bytes=%d", method, latency_ms, n_bytes)
+        else:
+            _log.debug("RPC method=%s latency_ms=%.0f resp_bytes=%d", method, latency_ms, n_bytes)
         return data["result"]
 
     def call_batch(self, calls: list) -> list:
@@ -98,14 +207,36 @@ class BitcoinRPC:
                 "method": method,
                 "params": params,
             })
-        resp = self.session.post(self.url, json=payloads, auth=self.auth, timeout=300)
-        resp.raise_for_status()
-        results_raw = resp.json()
+        method0 = calls[0][0]
+        t0 = time.time()
+        try:
+            resp = self.session.post(self.url, json=payloads, auth=self.auth, timeout=300)
+            resp.raise_for_status()
+            n_bytes = len(resp.content)          # capture BEFORE json() — a huge body can OOM the parse
+            self.last_resp_bytes = n_bytes
+            results_raw = resp.json()
+        except Exception as e:
+            _log.error("RPC batch transport error method=%s n_calls=%d url=%s err=%s",
+                       method0, len(calls), self.url, e)
+            raise
+        latency_ms = (time.time() - t0) * 1000
+        resp_mb = n_bytes / (1024 * 1024)
+        if resp_mb > _RPC_BIG_RESP_MB:
+            _log.warning("RPC batch LARGE RESPONSE method=%s n_calls=%d resp_mb=%.1f latency_ms=%.0f "
+                         "(large responses are a direct memory-spike cause)",
+                         method0, len(calls), resp_mb, latency_ms)
+        elif latency_ms > _RPC_SLOW_MS:
+            _log.warning("RPC batch SLOW method=%s n_calls=%d resp_mb=%.1f latency_ms=%.0f",
+                         method0, len(calls), resp_mb, latency_ms)
+        else:
+            _log.debug("RPC batch method=%s n_calls=%d resp_mb=%.1f latency_ms=%.0f",
+                       method0, len(calls), resp_mb, latency_ms)
         by_id = {r["id"]: r for r in results_raw}
         results = []
         for rid in ids:
             r = by_id[rid]
             if r.get("error"):
+                _log.error("RPC batch item error method=%s err=%s", method0, r["error"])
                 raise RuntimeError(f"RPC batch error: {r['error']}")
             results.append(r["result"])
         return results
@@ -236,6 +367,52 @@ CREATE INDEX IF NOT EXISTS idx_inputs_tx_hash          ON transaction_inputs(tra
 CREATE INDEX IF NOT EXISTS idx_outputs_tx_hash         ON transaction_outputs(transaction_hash);
 """
 
+DROP_INDEXES_SQL = """
+DROP INDEX IF EXISTS idx_blocks_hash;
+DROP INDEX IF EXISTS idx_blocks_number;
+DROP INDEX IF EXISTS idx_transactions_hash;
+DROP INDEX IF EXISTS idx_transactions_block_hash;
+DROP INDEX IF EXISTS idx_inputs_tx_hash;
+DROP INDEX IF EXISTS idx_outputs_tx_hash;
+"""
+
+
+# Expected column layout per table — used by validate_schema() to detect a
+# pre-existing database whose columns drifted from what this code writes.  A
+# mismatch makes every bulk INSERT ... SELECT * fail, which looks exactly like
+# a "stuck" sync (the retry loop re-tries the same height forever).
+EXPECTED_COLUMNS = {
+    "blocks": [
+        "hash", "number", "timestamp", "merkle_root", "bits", "nonce",
+        "version", "weight", "size", "stripped_size", "transaction_count",
+        "coinbase_param",
+    ],
+    "transactions": [
+        "hash", "block_hash", "block_number", "block_timestamp", "is_coinbase",
+        "index", "input_count", "output_count", "input_value", "output_value",
+        "fee", "size", "virtual_size", "version", "lock_time",
+    ],
+    "transaction_inputs": [
+        "transaction_hash", "index", "spent_transaction_hash", "spent_output_index",
+        "script_asm", "script_hex", "sequence", "required_signatures", "type",
+        "addresses", "value",
+    ],
+    "transaction_outputs": [
+        "transaction_hash", "index", "script_asm", "script_hex",
+        "required_signatures", "type", "addresses", "value",
+    ],
+    "mempool_transactions": [
+        "txid", "size", "vsize", "weight", "fee", "modified_fee",
+        "ancestor_count", "ancestor_size", "ancestor_fees", "descendant_count",
+        "descendant_size", "descendant_fees", "time_entered", "height_entered",
+        "bip125_replaceable", "depends", "spentby", "snapshot_time",
+    ],
+    "mempool_snapshots": [
+        "snapshot_time", "tx_count", "total_bytes", "total_fee", "memory_usage",
+        "max_mempool", "min_fee_rate", "min_relay_fee",
+    ],
+}
+
 
 def ensure_schema(con: duckdb.DuckDBPyConnection):
     """Create tables and indexes if they do not exist."""
@@ -247,6 +424,77 @@ def ensure_schema(con: duckdb.DuckDBPyConnection):
         stmt = stmt.strip()
         if stmt:
             con.execute(stmt)
+
+
+def validate_schema(con: duckdb.DuckDBPyConnection) -> bool:
+    """Compare the actual DB columns to EXPECTED_COLUMNS and log the result.
+
+    Returns True if every table matches.  Emits a single, greppable
+    ``SCHEMA_MISMATCH`` ERROR line per offending table so this failure mode is
+    diagnosed instantly instead of masquerading as an OOM or a stall.
+    """
+    ok = True
+    try:
+        rows = con.execute(
+            """SELECT table_name, column_name
+               FROM information_schema.columns
+               WHERE table_schema = 'main'
+               ORDER BY table_name, ordinal_position"""
+        ).fetchall()
+    except Exception:
+        log_exc(_log, "schema check: could not read information_schema")
+        return False
+
+    actual = {}
+    for table_name, column_name in rows:
+        actual.setdefault(table_name, []).append(column_name)
+
+    for table, expected in EXPECTED_COLUMNS.items():
+        got = actual.get(table)
+        if got is None:
+            _log.warning("schema check: %s MISSING (will be created)", table)
+            continue
+        if got == expected:
+            _log.info("schema check: %s OK (%d cols)", table, len(expected))
+        else:
+            ok = False
+            missing = [c for c in expected if c not in got]
+            extra = [c for c in got if c not in expected]
+            _log.error("SCHEMA_MISMATCH table=%s expected=%d cols found=%d cols "
+                       "missing=%s extra=%s order_ok=%s",
+                       table, len(expected), len(got), missing, extra,
+                       got[:len(expected)] == expected)
+    return ok
+
+
+def drop_indexes(con: duckdb.DuckDBPyConnection):
+    """Drop all indexes — used during bulk sync to speed up writes."""
+    t0 = time.time()
+    _log.info("drop_indexes start")
+    for stmt in DROP_INDEXES_SQL.strip().split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            con.execute(stmt)
+    _log.info("drop_indexes done elapsed_ms=%.0f", (time.time() - t0) * 1000)
+
+
+def create_indexes(con: duckdb.DuckDBPyConnection):
+    """(Re-)create all indexes — called after bulk sync finishes.
+
+    Each index is built and timed individually: rebuilding an index over
+    hundreds of millions of rows is memory-heavy, so if an OOM happens here
+    the per-index log tells us exactly which one.
+    """
+    overall = time.time()
+    for stmt in CREATE_INDEXES_SQL.strip().split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        t0 = time.time()
+        _log.info("create_index start: %s | %s", stmt, _mem_str())
+        con.execute(stmt)
+        _log.info("create_index done elapsed_ms=%.0f | %s", (time.time() - t0) * 1000, _mem_str())
+    _log.info("create_indexes ALL done elapsed_ms=%.0f", (time.time() - overall) * 1000)
 
 
 def get_synced_height(con: duckdb.DuckDBPyConnection) -> int:
@@ -409,88 +657,86 @@ def parse_rpc_block(block: dict):
 # Batch insert helpers
 # ---------------------------------------------------------------------------
 
+_BLOCK_COLS = [
+    "hash", "number", "timestamp", "merkle_root", "bits", "nonce",
+    "version", "weight", "size", "stripped_size", "transaction_count",
+    "coinbase_param",
+]
+
+_TX_COLS = [
+    "hash", "block_hash", "block_number", "block_timestamp", "is_coinbase",
+    "index", "input_count", "output_count", "input_value", "output_value",
+    "fee", "size", "virtual_size", "version", "lock_time",
+]
+
+_INPUT_COLS = [
+    "transaction_hash", "index", "spent_transaction_hash", "spent_output_index",
+    "script_asm", "script_hex", "sequence", "required_signatures", "type",
+    "addresses", "value",
+]
+
+_OUTPUT_COLS = [
+    "transaction_hash", "index", "script_asm", "script_hex",
+    "required_signatures", "type", "addresses", "value",
+]
+
+
 def _insert_blocks(con, rows):
     if not rows:
         return
-    con.executemany(
-        """INSERT INTO blocks
-           (hash, number, timestamp, merkle_root, bits, nonce, version,
-            weight, size, stripped_size, transaction_count, coinbase_param)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        [
-            (r["hash"], r["number"], r["timestamp"], r["merkle_root"],
-             r["bits"], r["nonce"], r["version"], r["weight"], r["size"],
-             r["stripped_size"], r["transaction_count"], r["coinbase_param"])
-            for r in rows
-        ],
-    )
+    df = pd.DataFrame(rows, columns=_BLOCK_COLS)
+    con.execute("INSERT INTO blocks SELECT * FROM df")
 
 
 def _insert_transactions(con, rows):
     if not rows:
         return
-    con.executemany(
-        """INSERT INTO transactions
-           (hash, block_hash, block_number, block_timestamp, is_coinbase,
-            "index", input_count, output_count, input_value, output_value,
-            fee, size, virtual_size, version, lock_time)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        [
-            (r["hash"], r["block_hash"], r["block_number"], r["block_timestamp"],
-             r["is_coinbase"], r["index"], r["input_count"], r["output_count"],
-             r["input_value"], r["output_value"], r["fee"], r["size"],
-             r["virtual_size"], r["version"], r["lock_time"])
-            for r in rows
-        ],
-    )
+    df = pd.DataFrame(rows, columns=_TX_COLS)
+    con.execute("INSERT INTO transactions SELECT * FROM df")
 
 
 def _insert_inputs(con, rows):
     if not rows:
         return
-    con.executemany(
-        """INSERT INTO transaction_inputs
-           (transaction_hash, "index", spent_transaction_hash, spent_output_index,
-            script_asm, script_hex, sequence, required_signatures, type,
-            addresses, value)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        [
-            (r["transaction_hash"], r["index"], r["spent_transaction_hash"],
-             r["spent_output_index"], r["script_asm"], r["script_hex"],
-             r["sequence"], r["required_signatures"], r["type"],
-             r["addresses"], r["value"])
-            for r in rows
-        ],
-    )
+    df = pd.DataFrame(rows, columns=_INPUT_COLS)
+    con.execute("INSERT INTO transaction_inputs SELECT * FROM df")
 
 
 def _insert_outputs(con, rows):
     if not rows:
         return
-    con.executemany(
-        """INSERT INTO transaction_outputs
-           (transaction_hash, "index", script_asm, script_hex,
-            required_signatures, type, addresses, value)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        [
-            (r["transaction_hash"], r["index"], r["script_asm"], r["script_hex"],
-             r["required_signatures"], r["type"], r["addresses"], r["value"])
-            for r in rows
-        ],
-    )
+    df = pd.DataFrame(rows, columns=_OUTPUT_COLS)
+    con.execute("INSERT INTO transaction_outputs SELECT * FROM df")
 
 
 def flush_batch(con, block_buf, tx_buf, in_buf, out_buf):
-    """Write buffered rows into DuckDB inside a transaction."""
+    """Write buffered rows into DuckDB inside a transaction.
+
+    Each sub-insert is wrapped so that, on failure, we log WHICH table failed
+    and a truncated sample row BEFORE the ROLLBACK throws the context away.
+    Previously the rollback masked the real cause.
+    """
     con.execute("BEGIN TRANSACTION")
     try:
-        _insert_blocks(con, block_buf)
-        _insert_transactions(con, tx_buf)
-        _insert_inputs(con, in_buf)
-        _insert_outputs(con, out_buf)
+        for name, fn, buf in (
+            ("blocks", _insert_blocks, block_buf),
+            ("transactions", _insert_transactions, tx_buf),
+            ("transaction_inputs", _insert_inputs, in_buf),
+            ("transaction_outputs", _insert_outputs, out_buf),
+        ):
+            try:
+                fn(con, buf)
+            except Exception:
+                sample = str(buf[0])[:400] if buf else "(empty)"
+                log_exc(_log, "flush_batch: INSERT into %s FAILED rows=%d sample=%s",
+                        name, len(buf), sample)
+                raise
         con.execute("COMMIT")
     except Exception:
-        con.execute("ROLLBACK")
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass  # DuckDB may have already aborted the transaction
         raise
     block_buf.clear()
     tx_buf.clear()
@@ -719,6 +965,8 @@ def sync_thread(
     db_path: str,
     batch_size: int = 50,
     poll_interval: int = 30,
+    blockchain_synced: threading.Event | None = None,
+    state: dict | None = None,
 ):
     """Run blockchain sync in a background thread.
 
@@ -726,11 +974,19 @@ def sync_thread(
     *write_lock* for each batch so mempool writes and reader cursors
     are never blocked for long.  Loops forever (with *poll_interval*
     sleeps between tip checks) until *stop_event* is set.
+
+    When *blockchain_synced* is provided, sets it once the chain is
+    fully caught up.  The mempool thread waits on this event so it
+    doesn't compete for the write lock during initial sync.
+
+    *state* is an optional shared dict the heartbeat thread reads to report
+    the live phase/height/last-flush-age.
     """
     rpc = BitcoinRPC(rpc_url, rpc_user, rpc_password)
 
     # Wait for node to be reachable and past IBD
-    print("[sync-thread] Waiting for Bitcoin Core node...", flush=True)
+    _log.info("Waiting for Bitcoin Core node at %s ...", rpc_url)
+    _set_state(state, phase="waiting_for_node")
     write_status(db_path, state="waiting_for_node",
                  message="Connecting to Bitcoin Core node...")
     while not stop_event.is_set():
@@ -742,7 +998,9 @@ def sync_thread(
             headers = info.get("headers", 0)
             if ibd:
                 pct = (blocks / headers * 100) if headers else 0
-                print(f"[sync-thread] IBD {pct:.1f}% ({blocks}/{headers}) [{chain}]", flush=True)
+                _log.info("node IBD %.1f%% (%d/%d) chain=%s verif=%s — waiting",
+                          pct, blocks, headers, chain, info.get("verificationprogress"))
+                _set_state(state, phase="node_ibd")
                 write_status(db_path,
                     state="node_ibd",
                     message=f"Bitcoin Core is syncing the blockchain ({pct:.1f}%)",
@@ -750,32 +1008,77 @@ def sync_thread(
                     node_progress_pct=round(pct, 2), chain=chain)
                 stop_event.wait(10)
                 continue
-            print(f"[sync-thread] Node ready — chain={chain}, height={blocks}", flush=True)
+            _log.info("node READY chain=%s height=%d headers=%d size_on_disk=%s pruned=%s",
+                      chain, blocks, headers, info.get("size_on_disk"), info.get("pruned"))
             write_status(db_path, state="node_ready",
                          message="Bitcoin Core ready, starting block sync...",
                          tip_height=blocks, chain=chain)
             break
         except requests.exceptions.ConnectionError:
-            print("[sync-thread] Node not reachable, retrying...", flush=True)
+            _log.warning("node not reachable at %s — retrying in 3s", rpc_url)
             write_status(db_path, state="waiting_for_node",
                          message="Waiting for Bitcoin Core node...")
             stop_event.wait(3)
-        except Exception as e:
-            print(f"[sync-thread] Error: {e}, retrying...", flush=True)
+        except Exception:
+            log_exc(_log, "node wait: unexpected error — retrying in 3s")
             stop_event.wait(3)
 
     # Main sync loop — runs forever until stop_event
+    pass_num = 0
     while not stop_event.is_set():
+        pass_num += 1
+        t_pass = time.time()
         try:
-            _sync_once(con, write_lock, rpc, db_path, batch_size, stop_event)
+            _sync_once(con, write_lock, rpc, db_path, batch_size, stop_event,
+                       blockchain_synced=blockchain_synced, state=state)
+        except duckdb.IOException as e:
+            # If this fires, the in-process single-connection model has regressed
+            # (something else holds a cross-process file lock). Name it explicitly.
+            _set_state(state, phase="error")
+            log_exc(_log, "DB_LOCK_CONTENTION pass #%d failed after %.0fs — duckdb.IOException "
+                          "(in-process MVCC assumption violated?)", pass_num, time.time() - t_pass)
+            write_status(db_path, state="error", message=f"DB lock error: {e}")
         except Exception as e:
-            print(f"[sync-thread] Sync error (will retry): {e}", flush=True)
-            write_status(db_path, state="error",
-                         message=f"Sync error: {e}")
+            _set_state(state, phase="error")
+            log_exc(_log, "sync pass #%d FAILED after %.0fs — retrying in %ds",
+                    pass_num, time.time() - t_pass, poll_interval)
+            write_status(db_path, state="error", message=f"Sync error: {e}")
         # Wait before checking for new blocks
         stop_event.wait(poll_interval)
 
-    print("[sync-thread] Stopped.", flush=True)
+    _log.info("sync thread stopped (stop_event set)")
+
+
+def _fetch_batch(rpc: BitcoinRPC, height: int, batch_size: int, tip_height: int):
+    """Fetch a batch of blocks from Bitcoin Core via RPC, with bounded retries.
+
+    Returns (raw_blocks, chunk_heights).  Runs in a background prefetch thread.
+    Retries transient RPC/network failures with exponential backoff so a brief
+    node hiccup self-heals instead of bubbling up and resetting the whole pass.
+    """
+    chunk_end = min(height + batch_size, tip_height + 1)
+    chunk_heights = list(range(height, chunk_end))
+    delay = 1.0
+    for attempt in range(1, _FETCH_MAX_ATTEMPTS + 1):
+        t0 = time.time()
+        try:
+            hashes = rpc.batch_getblockhash(chunk_heights)
+            raw_blocks = rpc.batch_getblock(hashes, verbosity=2)
+            elapsed_ms = (time.time() - t0) * 1000
+            tx = sum(len(b.get("tx", [])) for b in raw_blocks)
+            resp_mb = getattr(rpc, "last_resp_bytes", 0) / (1024 * 1024)
+            _log.debug("fetch ok heights=%d..%d n_blocks=%d tx=%d resp_mb=%.1f elapsed_ms=%.0f",
+                       chunk_heights[0], chunk_heights[-1], len(raw_blocks), tx, resp_mb, elapsed_ms)
+            return raw_blocks, chunk_heights
+        except Exception as e:
+            _log.warning("fetch FAIL heights=%d..%d attempt=%d/%d err=%s",
+                         chunk_heights[0], chunk_heights[-1], attempt, _FETCH_MAX_ATTEMPTS, e)
+            if attempt >= _FETCH_MAX_ATTEMPTS:
+                log_exc(_log, "fetch GAVE UP heights=%d..%d after %d attempts (POISON RANGE?)",
+                        chunk_heights[0], chunk_heights[-1], _FETCH_MAX_ATTEMPTS)
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 def _sync_once(
@@ -785,6 +1088,8 @@ def _sync_once(
     db_path: str,
     batch_size: int,
     stop_event: threading.Event,
+    blockchain_synced: threading.Event | None = None,
+    state: dict | None = None,
 ):
     """Sync from current DB height to chain tip (one pass)."""
     with write_lock:
@@ -793,82 +1098,301 @@ def _sync_once(
     tip_height = rpc.getblockcount()
 
     if start_height > tip_height:
+        _set_state(state, phase="synced", height=tip_height, tip=tip_height, pct=100.0)
         write_status(db_path, state="synced", message="Up to date",
                      current_height=tip_height, tip_height=tip_height,
-                     progress_pct=100.0, blocks_per_sec=0)
+                     progress_pct=100.0, blocks_per_sec=0,
+                     tx_progress_pct=100.0, tx_per_sec=0, tx_eta_sec=0)
         return
 
     total = tip_height - start_height + 1
-    print(f"[sync-thread] Syncing blocks {start_height:,} → {tip_height:,} "
-          f"({total:,} blocks)", flush=True)
+    bulk_mode = total > 1000
+    _log.info("=== sync pass start height=%d tip=%d total=%d bulk_mode=%s | %s ===",
+              start_height, tip_height, total, bulk_mode, _mem_str())
+    _set_state(state, phase="syncing", height=start_height, tip=tip_height, pct=0.0)
+
+    # ------------------------------------------------------------------
+    # Bulk-sync mode: drop indexes for much faster writes, lower WAL
+    # checkpoint threshold so each checkpoint stalls for a shorter time.
+    # ------------------------------------------------------------------
+    with write_lock:
+        con.execute("SET wal_autocheckpoint = '256MB'")
+        if bulk_mode:
+            drop_indexes(con)
 
     sync_t0 = time.time()
-    blocks_done = 0
     height = start_height
+
+    # Transaction-weighted progress: estimate total work in tx, not blocks
+    total_tx_estimate = estimate_cumulative_tx(tip_height)
+    base_tx = estimate_cumulative_tx(start_height)  # tx already done before this run
+    tx_synced = 0  # actual tx processed in this run
+
+    # Rolling window for tx/sec rate (last 60 seconds)
+    _WINDOW_SEC = 60
+    _rate_window: collections.deque = collections.deque()  # (timestamp, cumulative_tx_synced)
 
     write_status(db_path, state="syncing",
                  message=f"Starting sync of {total:,} blocks...",
                  current_height=start_height, tip_height=tip_height,
                  blocks_synced=0, total_blocks=total, progress_pct=0,
-                 blocks_per_sec=0, eta_sec=0)
+                 blocks_per_sec=0, eta_sec=0,
+                 tx_progress_pct=0, tx_per_sec=0, tx_eta_sec=0)
 
-    while height <= tip_height and not stop_event.is_set():
-        chunk_end = min(height + batch_size, tip_height + 1)
-        chunk_heights = list(range(height, chunk_end))
+    # Adaptive batch sizing: target ~5000 transactions per RPC batch so
+    # early tiny blocks fly through while later large blocks stay
+    # manageable.  The batch_size adjusts after every RPC batch.
+    TARGET_TX = 5000
+    MIN_BATCH = 5
+    MAX_BATCH = 100   # capped at 100 to prevent oversized RPC responses
 
-        # Fetch from RPC (no lock needed — purely network I/O)
-        hashes = rpc.batch_getblockhash(chunk_heights)
-        raw_blocks = rpc.batch_getblock(hashes, verbosity=2)
+    batch_num = 0  # RPC batches fetched
 
-        # Parse blocks (CPU-only, no lock needed)
-        block_buf, tx_buf, in_buf, out_buf = [], [], [], []
-        for block_json in raw_blocks:
-            block_row, txs, ins, outs = parse_rpc_block(block_json)
-            block_buf.append(block_row)
-            tx_buf.extend(txs)
-            in_buf.extend(ins)
-            out_buf.extend(outs)
+    # ------------------------------------------------------------------
+    # Accumulation: instead of writing every RPC batch (~5K tx), we
+    # accumulate parsed rows and flush to DuckDB when we reach 50K tx
+    # or 10 seconds — whichever comes first.  This reduces DuckDB
+    # transaction overhead by ~10x.
+    # ------------------------------------------------------------------
+    FLUSH_TX_THRESHOLD = 50_000
+    FLUSH_SEC_THRESHOLD = 10
+    CHECKPOINT_EVERY_N_FLUSHES = 10  # explicit CHECKPOINT every N flushes
 
-        # Write batch under the lock (brief — only the DB insert)
+    acc_blocks: list = []
+    acc_txs: list = []
+    acc_ins: list = []
+    acc_outs: list = []
+    last_flush_time = time.time()
+    flush_count = 0
+    last_height_flushed = start_height  # track highest block in last flush
+
+    # Pipeline: use a background thread to pre-fetch the next batch
+    # while the current one is being parsed / accumulated.
+    #
+    # IMPORTANT: The loop is ordered as Parse → Adapt → Prefetch → Accumulate/Flush
+    # so the prefetch always uses the CORRECTLY adapted batch_size.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="rpc-prefetch") as prefetch:
+        # Kick off the first fetch
+        future = prefetch.submit(_fetch_batch, rpc, height, batch_size, tip_height)
+
+        while height <= tip_height and not stop_event.is_set():
+            # --- Wait for the current fetch to complete ---
+            t_rpc = time.time()
+            raw_blocks, chunk_heights = future.result()
+            rpc_ms = (time.time() - t_rpc) * 1000
+
+            # --- Parse blocks (CPU-only, no lock) ---
+            t_parse = time.time()
+            batch_tx_count = 0
+            for block_json in raw_blocks:
+                block_row, txs, ins, outs = parse_rpc_block(block_json)
+                acc_blocks.append(block_row)
+                acc_txs.extend(txs)
+                acc_ins.extend(ins)
+                acc_outs.extend(outs)
+                batch_tx_count += len(txs)
+            parse_ms = (time.time() - t_parse) * 1000
+
+            # --- Adapt batch_size BEFORE prefetch so it uses the right size ---
+            if batch_tx_count > 0:
+                batch_size = max(MIN_BATCH, min(MAX_BATCH,
+                                                int(batch_size * TARGET_TX / batch_tx_count)))
+
+            # --- Submit next fetch with ADAPTED batch_size (overlaps with flush) ---
+            next_height = height + len(chunk_heights)
+            if next_height <= tip_height and not stop_event.is_set():
+                future = prefetch.submit(_fetch_batch, rpc, next_height, batch_size, tip_height)
+
+            # --- Bookkeeping ---
+            batch_num += 1
+            tx_synced += batch_tx_count
+
+            # Periodic timing log (every 10 RPC batches)
+            if batch_num % 10 == 0:
+                _log.info("batch %d bs=%d rpc_ms=%.0f parse_ms=%.0f batch_tx=%d acc_tx=%d | %s",
+                          batch_num, batch_size, rpc_ms, parse_ms, batch_tx_count,
+                          len(acc_txs), _mem_str())
+
+            # Periodic node-health re-poll: catch a node that reorgs or falls
+            # back into IBD mid-sync (otherwise invisible).
+            if batch_num % _NODE_HEALTH_EVERY_N_BATCHES == 0:
+                try:
+                    ni = rpc.getblockchaininfo()
+                    _log.info("node health: chain=%s blocks=%s headers=%s ibd=%s "
+                              "verif=%s size_on_disk=%s pruned=%s",
+                              ni.get("chain"), ni.get("blocks"), ni.get("headers"),
+                              ni.get("initialblockdownload"), ni.get("verificationprogress"),
+                              ni.get("size_on_disk"), ni.get("pruned"))
+                    if ni.get("initialblockdownload"):
+                        _log.warning("NODE_BACK_IN_IBD node re-entered initial block download "
+                                     "mid-sync — possible reorg or resync")
+                except Exception as e:
+                    _log.warning("node health poll failed: %s", e)
+
+            # --- Check if we should flush accumulated data to DuckDB ---
+            now = time.time()
+            is_last = next_height > tip_height
+            should_flush = (
+                len(acc_txs) >= FLUSH_TX_THRESHOLD
+                or (now - last_flush_time) >= FLUSH_SEC_THRESHOLD
+                or is_last
+            )
+
+            if should_flush and len(acc_txs) > 0:
+                # Capture counts before flush_batch clears the lists
+                n_flush_blk = len(acc_blocks)
+                n_flush_tx = len(acc_txs)
+                n_flush_in = len(acc_ins)
+                n_flush_out = len(acc_outs)
+
+                t_lock = time.time()
+                with write_lock:
+                    lock_wait_ms = (time.time() - t_lock) * 1000
+                    t_write = time.time()
+                    flush_batch(con, acc_blocks, acc_txs, acc_ins, acc_outs)
+                    write_ms = (time.time() - t_write) * 1000
+
+                flush_count += 1
+                last_flush_time = now
+                last_height_flushed = chunk_heights[-1]
+                _set_state(state, last_flush_time=now)
+
+                log_fn = _log.warning if (write_ms > _FLUSH_SLOW_MS or lock_wait_ms > _LOCK_SLOW_MS) else _log.info
+                log_fn("flush %d: %d blk %d tx %d in %d out  lock_wait_ms=%.0f write_ms=%.0f | %s",
+                       flush_count, n_flush_blk, n_flush_tx, n_flush_in, n_flush_out,
+                       lock_wait_ms, write_ms, _mem_str())
+
+                # Periodic explicit CHECKPOINT to keep WAL small and
+                # prevent surprise multi-second stalls.
+                if flush_count % CHECKPOINT_EVERY_N_FLUSHES == 0:
+                    wal_before = file_size_mb(db_path + ".wal")
+                    t_ckpt = time.time()
+                    try:
+                        with write_lock:
+                            con.execute("CHECKPOINT")
+                        ckpt_ms = (time.time() - t_ckpt) * 1000
+                        wal_after = file_size_mb(db_path + ".wal")
+                        ck_log = _log.warning if ckpt_ms > _CKPT_SLOW_MS else _log.info
+                        ck_log("checkpoint %d done ckpt_ms=%.0f wal_mb=%s->%s | %s",
+                               flush_count // CHECKPOINT_EVERY_N_FLUSHES, ckpt_ms,
+                               (f"{wal_before:.0f}" if wal_before is not None else "?"),
+                               (f"{wal_after:.0f}" if wal_after is not None else "?"),
+                               _mem_str())
+                    except Exception:
+                        log_exc(_log, "periodic checkpoint failed")
+
+            # --- Transaction-weighted progress & rolling-window ETA ---
+            _rate_window.append((now, tx_synced))
+            cutoff = now - _WINDOW_SEC
+            while _rate_window and _rate_window[0][0] < cutoff:
+                _rate_window.popleft()
+
+            if len(_rate_window) >= 2:
+                dt = _rate_window[-1][0] - _rate_window[0][0]
+                dtx = _rate_window[-1][1] - _rate_window[0][1]
+                tx_per_sec = dtx / dt if dt > 0 else 0
+            else:
+                elapsed = max(now - sync_t0, 0.01)
+                tx_per_sec = tx_synced / elapsed
+
+            tx_at_height = base_tx + tx_synced
+            tx_progress_pct = (tx_at_height / total_tx_estimate * 100) if total_tx_estimate > 0 else 0
+
+            remaining_tx = max(total_tx_estimate - tx_at_height, 0)
+            tx_eta_sec = remaining_tx / tx_per_sec if tx_per_sec > 0 else 0
+
+            # Block-based stats
+            blocks_done = next_height - start_height
+            elapsed = max(now - sync_t0, 0.01)
+            bps = blocks_done / elapsed
+            block_pct = (chunk_heights[-1] / tip_height * 100) if tip_height else 100
+
+            # Keep the heartbeat's view of progress current (cheap, every batch).
+            _set_state(state, height=chunk_heights[-1], tip=tip_height,
+                       pct=round(block_pct, 2))
+
+            # Write status every 5 RPC batches or at the end
+            if batch_num % 5 == 0 or is_last:
+                write_status(db_path,
+                    state="syncing",
+                    message=f"Syncing block {chunk_heights[-1]:,} of {tip_height:,}",
+                    current_height=chunk_heights[-1],
+                    start_height=start_height,
+                    tip_height=tip_height,
+                    blocks_synced=blocks_done,
+                    blocks_remaining=total - blocks_done,
+                    total_blocks=total,
+                    progress_pct=round(block_pct, 2),
+                    blocks_per_sec=round(bps, 1),
+                    elapsed_sec=round(elapsed),
+                    eta_sec=round(tx_eta_sec),
+                    # Transaction-weighted fields
+                    tx_synced=tx_synced,
+                    tx_per_sec=round(tx_per_sec),
+                    tx_progress_pct=round(tx_progress_pct, 2),
+                    tx_eta_sec=round(tx_eta_sec))
+
+            height = next_height
+
+    # ------------------------------------------------------------------
+    # Post-sync: recreate indexes (if dropped), final checkpoint.
+    # Index recreation is a known memory hot-spot — the heartbeat keeps
+    # ticking (separate thread) and we label the phase so its lines show
+    # 'building_indexes'.
+    # ------------------------------------------------------------------
+    if bulk_mode and not stop_event.is_set():
+        _log.info("recreating indexes (memory hot-spot — watch heartbeat) | %s", _mem_str())
+        _set_state(state, phase="building_indexes")
+        write_status(db_path, state="syncing",
+                     message="Building indexes...",
+                     current_height=tip_height, tip_height=tip_height,
+                     progress_pct=100.0, tx_progress_pct=round(tx_progress_pct, 2))
+        t_idx = time.time()
+        try:
+            with write_lock:
+                create_indexes(con)
+            _log.info("all indexes created total_ms=%.0f", (time.time() - t_idx) * 1000)
+        except Exception:
+            log_exc(_log, "index creation FAILED")
+
+    # Final checkpoint and restore normal auto-checkpoint
+    _set_state(state, phase="final_checkpoint")
+    wal_before = file_size_mb(db_path + ".wal")
+    t_ckpt = time.time()
+    try:
         with write_lock:
-            flush_batch(con, block_buf, tx_buf, in_buf, out_buf)
-
-        # Update progress
-        blocks_done = height + len(chunk_heights) - start_height
-        elapsed = max(time.time() - sync_t0, 0.01)
-        bps = blocks_done / elapsed
-        remaining = total - blocks_done
-        eta_sec = remaining / bps if bps > 0 else 0
-        pct = (chunk_heights[-1] / tip_height * 100) if tip_height else 100
-        write_status(db_path,
-            state="syncing",
-            message=f"Syncing block {chunk_heights[-1]:,} of {tip_height:,}",
-            current_height=chunk_heights[-1],
-            start_height=start_height,
-            tip_height=tip_height,
-            blocks_synced=blocks_done,
-            blocks_remaining=remaining,
-            total_blocks=total,
-            progress_pct=round(pct, 2),
-            blocks_per_sec=round(bps, 1),
-            elapsed_sec=round(elapsed),
-            eta_sec=round(eta_sec))
-
-        height = chunk_end
+            con.execute("SET wal_autocheckpoint = '256MB'")
+            con.execute("CHECKPOINT")
+        ckpt_ms = (time.time() - t_ckpt) * 1000
+        wal_after = file_size_mb(db_path + ".wal")
+        ck_log = _log.warning if ckpt_ms > _CKPT_SLOW_MS else _log.info
+        ck_log("final checkpoint done ckpt_ms=%.0f wal_mb=%s->%s",
+               ckpt_ms,
+               (f"{wal_before:.0f}" if wal_before is not None else "?"),
+               (f"{wal_after:.0f}" if wal_after is not None else "?"))
+    except Exception:
+        log_exc(_log, "final checkpoint failed")
 
     if not stop_event.is_set():
         with write_lock:
             final = get_synced_height(con)
         elapsed = max(time.time() - sync_t0, 0.01)
-        print(f"[sync-thread] Sync complete — height {final:,}, "
-              f"{total:,} blocks in {elapsed:.0f}s", flush=True)
+        _set_state(state, phase="synced", height=final, tip=tip_height, pct=100.0)
+        _log.info("=== sync pass complete height=%d total=%d elapsed_s=%.0f | %s ===",
+                  final, total, elapsed, _mem_str())
         write_status(db_path,
             state="synced",
             message=f"Synced to block {final:,}",
             current_height=final, tip_height=tip_height,
             progress_pct=100.0,
             blocks_per_sec=round(total / elapsed, 1),
-            elapsed_sec=round(elapsed), eta_sec=0)
+            elapsed_sec=round(elapsed), eta_sec=0,
+            tx_progress_pct=100.0, tx_per_sec=0, tx_eta_sec=0)
+
+        # Signal mempool thread that blockchain is caught up
+        if blockchain_synced is not None and not blockchain_synced.is_set():
+            _log.info("blockchain caught up — signalling mempool thread")
+            blockchain_synced.set()
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +1400,12 @@ def _sync_once(
 # ---------------------------------------------------------------------------
 
 def main():
+    try:
+        from logging_setup import setup_logging
+        setup_logging()
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+
     # Build defaults from environment variables (Umbrel injects these)
     rpc_host = os.environ.get("BITCOIN_RPC_HOST", "127.0.0.1")
     rpc_port = os.environ.get("BITCOIN_RPC_PORT", "48332")

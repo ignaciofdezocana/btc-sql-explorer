@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import sys
 import threading
@@ -21,7 +22,10 @@ import time
 from datetime import datetime
 
 import duckdb
+import pandas as pd
 import requests
+
+_log = logging.getLogger("btc_mempool")
 
 
 # ---------------------------------------------------------------------------
@@ -189,30 +193,27 @@ def parse_mempoolinfo(info: dict, snapshot_ts: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def refresh_mempool(con: duckdb.DuckDBPyConnection, tx_rows: list, snapshot_row: dict):
-    """Replace mempool_transactions and append a snapshot row."""
+    """Replace mempool_transactions and append a snapshot row.
+
+    Uses a Pandas DataFrame + DuckDB's vectorized INSERT … SELECT for
+    10-100x faster bulk insert compared to executemany row-by-row.
+    """
     con.execute("BEGIN TRANSACTION")
     try:
         # Full replace of current mempool state
         con.execute("DELETE FROM mempool_transactions")
 
         if tx_rows:
-            con.executemany(
-                """INSERT INTO mempool_transactions
-                   (txid, size, vsize, weight, fee, modified_fee,
-                    ancestor_count, ancestor_size, ancestor_fees,
-                    descendant_count, descendant_size, descendant_fees,
-                    time_entered, height_entered, bip125_replaceable,
-                    depends, spentby, snapshot_time)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                [
-                    (r["txid"], r["size"], r["vsize"], r["weight"],
-                     r["fee"], r["modified_fee"],
-                     r["ancestor_count"], r["ancestor_size"], r["ancestor_fees"],
-                     r["descendant_count"], r["descendant_size"], r["descendant_fees"],
-                     r["time_entered"], r["height_entered"], r["bip125_replaceable"],
-                     r["depends"], r["spentby"], r["snapshot_time"])
-                    for r in tx_rows
-                ],
+            _MEMPOOL_COLS = [
+                "txid", "size", "vsize", "weight", "fee", "modified_fee",
+                "ancestor_count", "ancestor_size", "ancestor_fees",
+                "descendant_count", "descendant_size", "descendant_fees",
+                "time_entered", "height_entered", "bip125_replaceable",
+                "depends", "spentby", "snapshot_time",
+            ]
+            df = pd.DataFrame(tx_rows, columns=_MEMPOOL_COLS)
+            con.execute(
+                "INSERT INTO mempool_transactions SELECT * FROM df"
             )
 
         # Append snapshot (keep history)
@@ -365,6 +366,7 @@ def mempool_sync_thread(
     rpc_password: str,
     db_path: str,
     interval: int = 15,
+    blockchain_synced: threading.Event | None = None,
 ):
     """Run mempool sync in a background thread.
 
@@ -372,35 +374,61 @@ def mempool_sync_thread(
     *write_lock* for each refresh so blockchain writes and reader
     cursors are never blocked for long.  Loops every *interval* seconds
     until *stop_event* is set.
+
+    If *blockchain_synced* is provided, the thread waits for it before
+    starting mempool polling.  This prevents the mempool writer from
+    competing for the write lock during the initial blockchain sync,
+    which would slow down block processing significantly.
     """
     rpc = BitcoinRPC(rpc_url, rpc_user, rpc_password)
     status_dir = os.path.dirname(db_path) or "."
     status_file = os.path.join(status_dir, "mempool_status.json")
 
-    print(f"[mempool-thread] Polling every {interval}s", flush=True)
+    # Wait for blockchain to finish initial sync before starting mempool
+    if blockchain_synced is not None:
+        _log.info("waiting for blockchain sync to complete before starting mempool polling")
+        _write_mempool_status(status_file,
+            state="waiting",
+            message="Waiting for blockchain sync to complete...")
+        while not blockchain_synced.is_set() and not stop_event.is_set():
+            blockchain_synced.wait(timeout=10)
+        if stop_event.is_set():
+            _log.info("mempool thread stopped while waiting")
+            return
+        _log.info("blockchain synced — starting mempool polling")
+
+    _log.info("mempool polling every %ds", interval)
     cycle = 0
 
     while not stop_event.is_set():
         t0 = time.time()
         try:
+            # --- RPC fetch ---
+            t_rpc = time.time()
             raw = rpc.getrawmempool(verbose=True)
             info = rpc.getmempoolinfo()
-            snapshot_ts = int(time.time())
+            rpc_ms = (time.time() - t_rpc) * 1000
 
+            snapshot_ts = int(time.time())
             tx_rows = parse_mempool(raw, snapshot_ts)
             snapshot_row = parse_mempoolinfo(info, snapshot_ts)
 
-            # Write under the shared lock (brief)
+            # --- Write under the shared lock ---
+            t_lock = time.time()
             with write_lock:
+                lock_wait_ms = (time.time() - t_lock) * 1000
+                t_write = time.time()
                 refresh_mempool(con, tx_rows, snapshot_row)
+                write_ms = (time.time() - t_write) * 1000
 
             elapsed = time.time() - t0
             cycle += 1
 
             if cycle % 4 == 1:
-                print(f"[mempool-thread] {len(tx_rows)} txs, "
-                      f"fees={snapshot_row['total_fee'] / 1e8:.4f} BTC, "
-                      f"took {elapsed:.1f}s", flush=True)
+                _log.info("mempool %d txs fees=%.4f BTC took=%.1fs "
+                          "(rpc_ms=%.0f lock_wait_ms=%.0f write_ms=%.0f)",
+                          len(tx_rows), snapshot_row['total_fee'] / 1e8, elapsed,
+                          rpc_ms, lock_wait_ms, write_ms)
 
             _write_mempool_status(status_file,
                 state="running",
@@ -413,7 +441,7 @@ def mempool_sync_thread(
                 last_refresh_ms=round(elapsed * 1000))
 
         except Exception as e:
-            print(f"[mempool-thread] Error: {e}", flush=True)
+            _log.error("mempool refresh error: %s", e, exc_info=True)
             _write_mempool_status(status_file,
                 state="error", message=str(e))
 
@@ -422,7 +450,7 @@ def mempool_sync_thread(
         if sleep_time > 0:
             stop_event.wait(sleep_time)
 
-    print("[mempool-thread] Stopped.", flush=True)
+    _log.info("mempool thread stopped (stop_event set)")
 
 
 def _write_mempool_status(path: str, **fields):
@@ -442,6 +470,12 @@ def _write_mempool_status(path: str, **fields):
 # ---------------------------------------------------------------------------
 
 def main():
+    try:
+        from logging_setup import setup_logging
+        setup_logging()
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+
     rpc_host = os.environ.get("BITCOIN_RPC_HOST", "127.0.0.1")
     rpc_port = os.environ.get("BITCOIN_RPC_PORT", "48332")
     default_rpc_url = f"http://{rpc_host}:{rpc_port}"
