@@ -305,7 +305,6 @@ CREATE TABLE IF NOT EXISTS transaction_inputs (
     "index"                BIGINT,
     spent_transaction_hash VARCHAR,
     spent_output_index     BIGINT,
-    script_asm             VARCHAR,
     script_hex             VARCHAR,
     sequence               BIGINT,
     required_signatures    BIGINT,
@@ -317,7 +316,6 @@ CREATE TABLE IF NOT EXISTS transaction_inputs (
 CREATE TABLE IF NOT EXISTS transaction_outputs (
     transaction_hash    VARCHAR,
     "index"             BIGINT,
-    script_asm          VARCHAR,
     script_hex          VARCHAR,
     required_signatures BIGINT,
     type                VARCHAR,
@@ -394,11 +392,11 @@ EXPECTED_COLUMNS = {
     ],
     "transaction_inputs": [
         "transaction_hash", "index", "spent_transaction_hash", "spent_output_index",
-        "script_asm", "script_hex", "sequence", "required_signatures", "type",
+        "script_hex", "sequence", "required_signatures", "type",
         "addresses", "value",
     ],
     "transaction_outputs": [
-        "transaction_hash", "index", "script_asm", "script_hex",
+        "transaction_hash", "index", "script_hex",
         "required_signatures", "type", "addresses", "value",
     ],
     "mempool_transactions": [
@@ -601,7 +599,6 @@ def parse_rpc_block(block: dict):
                     "index": in_idx,
                     "spent_transaction_hash": "0" * 64,
                     "spent_output_index": 0xFFFFFFFF,
-                    "script_asm": vin.get("coinbase", ""),
                     "script_hex": vin.get("coinbase", ""),
                     "sequence": vin.get("sequence", 0),
                     "required_signatures": 0,
@@ -624,7 +621,6 @@ def parse_rpc_block(block: dict):
                 "index": in_idx,
                 "spent_transaction_hash": vin.get("txid", ""),
                 "spent_output_index": vin.get("vout", 0),
-                "script_asm": script_sig.get("asm", ""),
                 "script_hex": script_sig.get("hex", ""),
                 "sequence": vin.get("sequence", 0),
                 "required_signatures": 1,
@@ -642,7 +638,6 @@ def parse_rpc_block(block: dict):
             output_rows.append({
                 "transaction_hash": tx_hash,
                 "index": vout.get("n", 0),
-                "script_asm": spk.get("asm", ""),
                 "script_hex": spk.get("hex", ""),
                 "required_signatures": spk.get("reqSigs", 1) if "reqSigs" in spk else 1,
                 "type": spk.get("type", "unknown"),
@@ -671,12 +666,12 @@ _TX_COLS = [
 
 _INPUT_COLS = [
     "transaction_hash", "index", "spent_transaction_hash", "spent_output_index",
-    "script_asm", "script_hex", "sequence", "required_signatures", "type",
+    "script_hex", "sequence", "required_signatures", "type",
     "addresses", "value",
 ]
 
 _OUTPUT_COLS = [
-    "transaction_hash", "index", "script_asm", "script_hex",
+    "transaction_hash", "index", "script_hex",
     "required_signatures", "type", "addresses", "value",
 ]
 
@@ -1154,7 +1149,7 @@ def _sync_once(
     # or 10 seconds — whichever comes first.  This reduces DuckDB
     # transaction overhead by ~10x.
     # ------------------------------------------------------------------
-    FLUSH_TX_THRESHOLD = 50_000
+    FLUSH_TX_THRESHOLD = int(os.environ.get("FLUSH_TX_THRESHOLD", "15000"))
     FLUSH_SEC_THRESHOLD = 10
     CHECKPOINT_EVERY_N_FLUSHES = 10  # explicit CHECKPOINT every N flushes
 

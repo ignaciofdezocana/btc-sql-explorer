@@ -38,7 +38,7 @@ from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
 setup_logging()
 log = logging.getLogger("web")
 
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.5")
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.6")
 LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
 
@@ -103,10 +103,22 @@ _check_writable(os.path.dirname(DB_PATH) or ".")
 # Single connection — DuckDB's in-process MVCC handles concurrent reads
 # while a writer holds the lock.  The write_lock serialises the two
 # sync threads so only one writes at a time.
-_db: duckdb.DuckDBPyConnection = duckdb.connect(DB_PATH)
-_db.execute("SET memory_limit = '1536MB'")                # explicit cap — prevents OOM on 16 GB devices
-_db.execute("SET preserve_insertion_order = false")       # lower memory during bulk inserts
-_db.execute("SET threads = 2")                            # less memory pressure; leave cores for OS/Bitcoin Core
+#
+# memory_limit / threads are env-tunable so they can be matched to the
+# container's RAM/CPU cap without a rebuild.
+_DUCKDB_MEMORY_LIMIT = os.environ.get("DUCKDB_MEMORY_LIMIT", "1536MB")
+_DUCKDB_THREADS = int(os.environ.get("DUCKDB_THREADS", "2"))
+
+
+def _open_db() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(DB_PATH)
+    con.execute(f"SET memory_limit = '{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute("SET preserve_insertion_order = false")     # lower memory during bulk inserts
+    con.execute(f"SET threads = {_DUCKDB_THREADS}")
+    return con
+
+
+_db: duckdb.DuckDBPyConnection = _open_db()
 _write_lock = threading.Lock()
 _stop_event = threading.Event()
 _blockchain_synced = threading.Event()  # set once blockchain reaches chain tip
@@ -120,10 +132,26 @@ _sync_state = {
     "last_flush_time": time.time(),
 }
 
-# Ensure all tables (blockchain + mempool) exist, then validate the layout.
+# Ensure all tables exist, then validate the layout.  If a pre-existing DB
+# predates a schema change (e.g. the v1.8.6 removal of script_asm), the bulk
+# INSERT would fail on every flush — so detect the mismatch and rebuild the
+# database from genesis.  Saved queries live in a separate file and are kept.
 with _write_lock:
     ensure_schema(_db)
-    validate_schema(_db)         # logs SCHEMA_MISMATCH if a pre-existing DB drifted
+    if not validate_schema(_db):
+        log.warning("SCHEMA_UPGRADE: existing database does not match this version's "
+                    "schema — rebuilding from genesis. Any partial sync is discarded "
+                    "(saved queries are unaffected).")
+        _db.close()
+        for _p in (DB_PATH, DB_PATH + ".wal"):
+            try:
+                os.remove(_p)
+                log.info("removed %s for clean rebuild", _p)
+            except FileNotFoundError:
+                pass
+        _db = _open_db()
+        ensure_schema(_db)
+        validate_schema(_db)
 
 # Log the DuckDB settings that actually took effect (confirm they applied).
 for _s in ("memory_limit", "threads", "preserve_insertion_order", "wal_autocheckpoint"):

@@ -72,11 +72,13 @@ function SyncBanner({ status }: { status: SyncStatus }) {
   const state = status.state;
   let text = status.message || 'Syncing...';
   if (state === 'syncing') {
-    // Show block-based percentage (matches the block numbers the user sees)
-    // but use tx-weighted ETA which is more accurate for time remaining
-    const blockPct = status.progress_pct;
+    // Lead with TRANSACTION-weighted progress \u2014 the honest measure of work
+    // done. Block-based % is misleading: early blocks are nearly empty, so it
+    // races to ~25% and then crawls through the dense middle of the chain,
+    // looking "stuck". Block height is shown as secondary context.
+    const txPct = status.tx_progress_pct ?? 0;
     const eta = (status.tx_eta_sec > 0) ? status.tx_eta_sec : status.eta_sec;
-    text = `Syncing: block ${status.current_height?.toLocaleString()} of ${status.tip_height?.toLocaleString()} (${blockPct?.toFixed(1)}%)`;
+    text = `Syncing ${txPct.toFixed(1)}% of transactions \u00b7 block ${status.current_height?.toLocaleString()}/${status.tip_height?.toLocaleString()}`;
     if (status.tx_per_sec > 0) {
       text += ` \u00b7 ${formatTxRate(status.tx_per_sec)}`;
     } else if (status.blocks_per_sec > 0) {
