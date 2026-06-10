@@ -354,13 +354,13 @@ sequenceDiagram
     participant M as btc_web_app
 
     E->>E: fix /data perms, boot snapshot + counter
-    E->>E: delete stale WAL; remove DB if over 20 GB (bloat guard)
+    E->>E: delete stale WAL, remove DB if over 20 GB (bloat guard)
     E->>G: exec gosu app gunicorn ...
     G->>M: import module (top-level code runs)
     M->>M: open DuckDB, set memory/threads, ensure schema
     M->>M: if schema mismatch, rebuild from genesis
     M->>M: start blockchain + mempool + heartbeat threads
-    G->>G: serving on :5001
+    G->>G: serving on port 5001
 ```
 
 ---
