@@ -38,7 +38,7 @@ from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
 setup_logging()
 log = logging.getLogger("web")
 
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.6")
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.7")
 LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
 
@@ -757,7 +757,7 @@ WITH daily_stats AS (
         AVG(CASE WHEN is_coinbase = false THEN fee END) as avg_fee,
         COUNT(DISTINCT block_hash) as blocks_mined,
         AVG(size) as avg_tx_size
-    FROM transactions 
+    FROM v_transactions
     GROUP BY block_timestamp::DATE
 )
 SELECT 
@@ -819,7 +819,7 @@ WITH monthly_coinbase AS (
     SELECT
         STRFTIME(block_timestamp::DATE, '%Y-%m') AS month,
         SUM(output_value) AS coinbase_satoshis
-    FROM transactions
+    FROM v_transactions
     WHERE is_coinbase = true
     GROUP BY month
 )
@@ -838,7 +838,7 @@ WITH monthly AS (
         STRFTIME(block_timestamp::DATE, '%Y-%m') AS month,
         SUM(CASE WHEN is_coinbase THEN output_value ELSE 0 END) AS total_coinbase,
         SUM(CASE WHEN NOT is_coinbase THEN fee ELSE 0 END) AS total_fees
-    FROM transactions
+    FROM v_transactions
     GROUP BY month
 )
 SELECT
@@ -950,7 +950,7 @@ WITH large_transactions AS (
             WHEN input_count = 1 THEN 'Distribution' 
             ELSE 'Complex'
         END as tx_pattern
-    FROM transactions 
+    FROM v_transactions
     WHERE output_value > 100000000000  -- More than 1000 BTC
       AND is_coinbase = false
 )
@@ -982,7 +982,7 @@ SELECT
     t.input_count,
     t.output_count,
     t.size AS tx_size_bytes
-FROM transactions t
+FROM v_transactions t
 WHERE NOT t.is_coinbase
 ORDER BY t.output_value DESC
 LIMIT 25"""
@@ -1004,7 +1004,7 @@ WITH fee_stats AS (
         MAX(fee) as max_fee,
         COUNT(CASE WHEN fee = 0 THEN 1 END) as zero_fee_count,
         AVG(virtual_size) as avg_vsize
-    FROM transactions 
+    FROM v_transactions
     WHERE is_coinbase = false AND fee IS NOT NULL
     GROUP BY block_timestamp::DATE
 )
@@ -1134,7 +1134,7 @@ SELECT
     b.nonce,
     LEFT(b.hash, 20) || '...' AS block_hash
 FROM blocks b
-JOIN transactions t ON t.block_hash = b.hash AND t.is_coinbase = true
+JOIN transactions t ON t.block_number = b.number AND t.is_coinbase = true
 WHERE b.number <= 20
 ORDER BY b.number"""
                 },
@@ -1148,7 +1148,7 @@ WITH monthly_tx AS (
         COUNT(CASE WHEN virtual_size < size THEN 1 END) AS segwit_tx,
         ROUND(AVG(CASE WHEN virtual_size < size THEN fee * 1.0 / virtual_size END), 2) AS avg_segwit_feerate,
         ROUND(AVG(CASE WHEN virtual_size >= size THEN fee * 1.0 / size END), 2) AS avg_legacy_feerate
-    FROM transactions
+    FROM v_transactions
     WHERE NOT is_coinbase
     GROUP BY month
 )
@@ -1172,7 +1172,7 @@ WITH monthly_opreturn AS (
         COUNT(DISTINCT t.block_number) AS blocks_with_opreturn,
         COUNT(DISTINCT o.transaction_hash) AS transactions_with_opreturn
     FROM transaction_outputs o
-    JOIN transactions t ON o.transaction_hash = t.hash
+    JOIN v_transactions t ON o.transaction_hash = t.hash
     WHERE o.type = 'nulldata'
     GROUP BY month
 )

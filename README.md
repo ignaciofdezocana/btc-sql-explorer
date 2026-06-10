@@ -202,13 +202,19 @@ erDiagram
 | Table | Description |
 |---|---|
 | `blocks` | One row per block (hash, height, timestamp, size, weight, tx count, coinbase message) |
-| `transactions` | One row per tx (block ref, is_coinbase, input/output value, computed fee, sizes) |
-| `transaction_inputs` | One row per input (source tx, `script_hex`, type, address(es), value) |
+| `transactions` | One row per tx (block_number, is_coinbase, input/output value, computed fee, sizes) |
+| `transaction_inputs` | One row per input (source tx, type, address(es), value) |
 | `transaction_outputs` | One row per output (`script_hex`, script type, address(es), value) |
 | `mempool_transactions` | Current unconfirmed transactions (fully refreshed every 15s) |
 | `mempool_snapshots` | Rolling 7-day history of mempool size/fee summaries |
+| `v_transactions` *(view)* | `transactions` joined to `blocks` — adds `block_timestamp` and `block_hash`. Query this when you need a tx's block time/hash. |
 
-Saved queries are kept in a **separate SQLite file** so they never contend with the DuckDB sync.
+To keep the database small, the `transactions` table is **denormalized-free**: it
+stores only `block_number`, not the (derivable) `block_timestamp`/`block_hash`,
+and `transaction_inputs` does not store raw scriptSig hex. Use the
+**`v_transactions`** view (above) whenever you need block time or hash on a
+transaction. Saved queries are kept in a **separate SQLite file** so they never
+contend with the DuckDB sync.
 
 ---
 

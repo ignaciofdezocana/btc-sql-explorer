@@ -284,9 +284,7 @@ CREATE TABLE IF NOT EXISTS blocks (
 
 CREATE TABLE IF NOT EXISTS transactions (
     hash            VARCHAR NOT NULL,
-    block_hash      VARCHAR,
     block_number    BIGINT,
-    block_timestamp VARCHAR,
     is_coinbase     BOOLEAN,
     "index"         BIGINT,
     input_count     BIGINT,
@@ -305,7 +303,6 @@ CREATE TABLE IF NOT EXISTS transaction_inputs (
     "index"                BIGINT,
     spent_transaction_hash VARCHAR,
     spent_output_index     BIGINT,
-    script_hex             VARCHAR,
     sequence               BIGINT,
     required_signatures    BIGINT,
     type                   VARCHAR,
@@ -360,7 +357,7 @@ CREATE_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_blocks_hash             ON blocks(hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_number           ON blocks(number);
 CREATE INDEX IF NOT EXISTS idx_transactions_hash       ON transactions(hash);
-CREATE INDEX IF NOT EXISTS idx_transactions_block_hash ON transactions(block_hash);
+CREATE INDEX IF NOT EXISTS idx_transactions_block_num  ON transactions(block_number);
 CREATE INDEX IF NOT EXISTS idx_inputs_tx_hash          ON transaction_inputs(transaction_hash);
 CREATE INDEX IF NOT EXISTS idx_outputs_tx_hash         ON transaction_outputs(transaction_hash);
 """
@@ -369,9 +366,35 @@ DROP_INDEXES_SQL = """
 DROP INDEX IF EXISTS idx_blocks_hash;
 DROP INDEX IF EXISTS idx_blocks_number;
 DROP INDEX IF EXISTS idx_transactions_hash;
-DROP INDEX IF EXISTS idx_transactions_block_hash;
+DROP INDEX IF EXISTS idx_transactions_block_num;
 DROP INDEX IF EXISTS idx_inputs_tx_hash;
 DROP INDEX IF EXISTS idx_outputs_tx_hash;
+"""
+
+# v_transactions re-exposes the denormalized columns dropped from the physical
+# `transactions` table (block_hash, block_timestamp) by joining `blocks`.
+# Queries that need a tx's block time/hash should read from this view; the
+# sync writes only to the slim physical table.
+CREATE_VIEWS_SQL = """
+CREATE OR REPLACE VIEW v_transactions AS
+SELECT
+    t.hash,
+    t.block_number,
+    b.hash      AS block_hash,
+    b.timestamp AS block_timestamp,
+    t.is_coinbase,
+    t."index",
+    t.input_count,
+    t.output_count,
+    t.input_value,
+    t.output_value,
+    t.fee,
+    t.size,
+    t.virtual_size,
+    t.version,
+    t.lock_time
+FROM transactions t
+JOIN blocks b ON t.block_number = b.number;
 """
 
 
@@ -386,13 +409,13 @@ EXPECTED_COLUMNS = {
         "coinbase_param",
     ],
     "transactions": [
-        "hash", "block_hash", "block_number", "block_timestamp", "is_coinbase",
+        "hash", "block_number", "is_coinbase",
         "index", "input_count", "output_count", "input_value", "output_value",
         "fee", "size", "virtual_size", "version", "lock_time",
     ],
     "transaction_inputs": [
         "transaction_hash", "index", "spent_transaction_hash", "spent_output_index",
-        "script_hex", "sequence", "required_signatures", "type",
+        "sequence", "required_signatures", "type",
         "addresses", "value",
     ],
     "transaction_outputs": [
@@ -413,12 +436,16 @@ EXPECTED_COLUMNS = {
 
 
 def ensure_schema(con: duckdb.DuckDBPyConnection):
-    """Create tables and indexes if they do not exist."""
+    """Create tables, indexes, and views if they do not exist."""
     for stmt in CREATE_TABLES_SQL.strip().split(";"):
         stmt = stmt.strip()
         if stmt:
             con.execute(stmt)
     for stmt in CREATE_INDEXES_SQL.strip().split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            con.execute(stmt)
+    for stmt in CREATE_VIEWS_SQL.strip().split(";"):
         stmt = stmt.strip()
         if stmt:
             con.execute(stmt)
@@ -574,9 +601,7 @@ def parse_rpc_block(block: dict):
 
         tx_rows.append({
             "hash": tx_hash,
-            "block_hash": block_hash,
             "block_number": block_height,
-            "block_timestamp": block_ts,
             "is_coinbase": is_coinbase,
             "index": tx_idx,
             "input_count": len(tx.get("vin", [])),
@@ -599,7 +624,6 @@ def parse_rpc_block(block: dict):
                     "index": in_idx,
                     "spent_transaction_hash": "0" * 64,
                     "spent_output_index": 0xFFFFFFFF,
-                    "script_hex": vin.get("coinbase", ""),
                     "sequence": vin.get("sequence", 0),
                     "required_signatures": 0,
                     "type": "coinbase",
@@ -608,7 +632,6 @@ def parse_rpc_block(block: dict):
                 })
                 continue
 
-            script_sig = vin.get("scriptSig", {})
             prevout = vin.get("prevout", {})
             spk = prevout.get("scriptPubKey", {})
 
@@ -621,7 +644,6 @@ def parse_rpc_block(block: dict):
                 "index": in_idx,
                 "spent_transaction_hash": vin.get("txid", ""),
                 "spent_output_index": vin.get("vout", 0),
-                "script_hex": script_sig.get("hex", ""),
                 "sequence": vin.get("sequence", 0),
                 "required_signatures": 1,
                 "type": spk.get("type", "unknown"),
@@ -659,14 +681,14 @@ _BLOCK_COLS = [
 ]
 
 _TX_COLS = [
-    "hash", "block_hash", "block_number", "block_timestamp", "is_coinbase",
+    "hash", "block_number", "is_coinbase",
     "index", "input_count", "output_count", "input_value", "output_value",
     "fee", "size", "virtual_size", "version", "lock_time",
 ]
 
 _INPUT_COLS = [
     "transaction_hash", "index", "spent_transaction_hash", "spent_output_index",
-    "script_hex", "sequence", "required_signatures", "type",
+    "sequence", "required_signatures", "type",
     "addresses", "value",
 ]
 
