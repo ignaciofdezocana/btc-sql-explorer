@@ -166,6 +166,19 @@ A single in-memory **`write_lock`** makes the two writer threads take turns;
 All blockchain + mempool data lives in one DuckDB file. Bitcoin amounts are
 stored in **satoshis** (integers) for exact math.
 
+> **Two kinds of data: blockchain (confirmed) vs mempool (pending).**
+> The `blocks` / `transactions` / `transaction_inputs` / `transaction_outputs`
+> tables are the **confirmed** chain — transactions already mined into blocks
+> (ingested via `getblock`). The `mempool_*` tables are **unconfirmed, pending**
+> transactions — broadcast to the network but *not yet in any block* (polled
+> via `getrawmempool` every 15s). They're a separate, live data source: a
+> pending transaction doesn't appear in the blockchain tables until it's mined,
+> and the mempool constantly churns (txs confirm, get replaced via RBF, or are
+> evicted), so `mempool_transactions` is **fully replaced each cycle** while
+> `mempool_snapshots` keeps a rolling 7-day summary for congestion history.
+> Note: the mempool poller only starts **after** the initial blockchain sync
+> finishes, so the `mempool_*` tables stay empty until the chain is caught up.
+
 ```mermaid
 erDiagram
     blocks ||--o{ transactions : contains
