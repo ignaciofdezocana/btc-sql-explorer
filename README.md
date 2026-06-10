@@ -11,6 +11,8 @@ plus a live view of the mempool. Your data never leaves your device.
 > markets, whale movements, mining patterns, script-type distributions, SegWit
 > adoption, dust outputs, mempool congestion, and more.
 
+![BTC SQL Explorer — SQL editor, results table, query library, and the live sync banner](docs/screenshot.png)
+
 ---
 
 ## Features
@@ -27,38 +29,182 @@ plus a live view of the mempool. Your data never leaves your device.
 
 ---
 
+## The big picture
+
+The app is a single program with a few moving parts. The browser only ever
+talks to the web server; the web server owns the database and the sync workers.
+
+```mermaid
+flowchart TB
+    subgraph node["Bitcoin Core (your node)"]
+        RPC["JSON-RPC interface"]
+    end
+
+    subgraph container["BTC SQL Explorer (one container)"]
+        direction TB
+        subgraph gunicorn["One web-server process (Gunicorn)"]
+            WEB["Flask app<br/>(UI + API)"]
+            T1["Blockchain sync thread"]
+            T2["Mempool sync thread"]
+            HB["Heartbeat / resource monitor"]
+        end
+        DB[("DuckDB<br/>bitcoin_blockchain.db")]
+        SQ[("SQLite<br/>saved_queries.db")]
+    end
+
+    BROWSER["Your web browser (React)"]
+
+    RPC <-->|"fetch blocks & mempool"| T1
+    RPC <-->|"poll mempool"| T2
+    T1 -->|"bulk writes"| DB
+    T2 -->|"writes"| DB
+    WEB -->|"reads (queries)"| DB
+    WEB <-->|"save / load"| SQ
+    BROWSER <-->|"HTTP / JSON"| WEB
+
+    style node fill:#fff7ed,stroke:#f7931a
+    style container fill:#eff6ff,stroke:#2563eb
+    style BROWSER fill:#ecfdf5,stroke:#10b981
+```
+
+Key ideas:
+
+- **Everything runs in one process.** The web server *and* the two sync workers
+  (plus a heartbeat monitor) live inside the same Gunicorn process.
+- **Two databases.** A big **DuckDB** file holds the chain/mempool data you
+  query; a tiny **SQLite** file holds your saved queries — separate files, so a
+  query-save never contends with the heavy sync.
+
+---
+
 ## How it works
 
-Everything runs in **one process**. A [Flask](https://flask.palletsprojects.com)
-app (served by [Gunicorn](https://gunicorn.org)) serves the UI and API, and the
-blockchain + mempool syncers run as **background threads inside the same
-process**, sharing a single DuckDB connection. DuckDB's in-process MVCC lets
-many readers (your queries) run concurrently with the single writer (the
-syncer) — no file-lock contention, no "database is busy" errors.
+There are two independent loops: a **collection loop** (always pulling new data
+from your node into DuckDB) and an **exploration loop** (your queries, on
+demand). You don't wait for the sync to finish — you can query whatever's
+already there.
 
-```
-Bitcoin Core ──RPC──▶ sync threads ──▶ DuckDB ◀──reads── Flask API ◀──HTTP──▶ React UI
-                          │
-                          └─ blockchain sync (batched, adaptive, pipelined)
-                          └─ mempool sync (every 15s, after chain is caught up)
+```mermaid
+sequenceDiagram
+    participant N as Bitcoin Core
+    participant S as Sync thread
+    participant D as DuckDB
+    participant W as Flask API
+    participant B as Browser
+
+    Note over S,N: Collection (continuous, background)
+    S->>N: "give me blocks X..Y" (batch RPC)
+    N-->>S: blocks of raw JSON
+    S->>S: reshape → rows (blocks/tx/inputs/outputs)
+    S->>D: bulk-insert (vectorized)
+
+    Note over B,W: Exploration (on demand)
+    B->>W: POST /api/execute { "query": "SELECT ..." }
+    W->>D: run SQL
+    D-->>W: result rows
+    W-->>B: JSON { columns, data, timing }
 ```
 
-- **Batched RPC** — fetches many blocks per HTTP request; **adaptive batch sizing** targets a constant ~5,000 tx/batch so dense and sparse eras both stay manageable.
+The syncer is tuned for constrained home devices:
+
+- **Batched RPC** — many blocks per HTTP request.
+- **Adaptive batch sizing** — targets a constant ~5,000 tx/batch so early
+  (tiny) and recent (dense) blocks both stay manageable.
+- **Pipelined** — the next batch downloads while the current one is parsed/written.
 - **Bulk vectorized inserts** via pandas DataFrames (`INSERT … SELECT * FROM df`).
-- **Indexes dropped during bulk sync** and rebuilt at the end; **WAL checkpoints** kept small to avoid stalls.
-- **Transaction-weighted progress** so the ETA stays honest as blocks get denser.
+- **Indexes dropped during bulk sync** and rebuilt at the end; **WAL
+  checkpoints** kept small to avoid multi-second stalls.
+- **Transaction-weighted progress** so the ETA stays honest as blocks get denser
+  (block % races to ~25% then crawls — tx % is the real measure).
 
-### Data model
+```mermaid
+flowchart LR
+    A["fetch batch<br/>(prefetched)"] --> B["parse → rows"]
+    B --> C["adapt batch size"]
+    C --> D["accumulate<br/>(~15k tx)"]
+    D --> E{"flush?"}
+    E -->|"yes"| F["bulk write<br/>(under write-lock)"]
+    E -->|"no"| A
+    F --> G{"every 10th flush"}
+    G -->|"yes"| H["checkpoint<br/>(keep WAL small)"]
+    G -->|"no"| A
+    H --> A
+    style F fill:#dbeafe
+```
+
+### Concurrency — one process, in-process MVCC
+
+The single most important design choice. Three things touch the database at
+once: the blockchain writer, the mempool writer, and your read queries. Running
+the syncers as *separate processes* used to cause cross-process file-lock
+contention ("database is busy"). The fix: **one process, one shared DuckDB
+connection.** DuckDB's in-process **MVCC** lets many readers run concurrently
+with a single writer — no file-lock fighting.
+
+```mermaid
+flowchart TB
+    subgraph proc["ONE Gunicorn process"]
+        CONN[("Single DuckDB connection")]
+        LOCK{{"write_lock"}}
+        TB["Blockchain thread"] -->|"acquire to write"| LOCK
+        TM["Mempool thread"] -->|"acquire to write"| LOCK
+        LOCK --> CONN
+        R1["Query cursor 1"] -->|"read freely"| CONN
+        R2["Query cursor 2"] -->|"read freely"| CONN
+    end
+    style LOCK fill:#fef3c7
+    style CONN fill:#dbeafe
+```
+
+A single in-memory **`write_lock`** makes the two writer threads take turns;
+**readers don't need the lock at all** (MVCC), so queries never block on the sync.
+
+---
+
+## Data model
 
 All blockchain + mempool data lives in one DuckDB file. Bitcoin amounts are
 stored in **satoshis** (integers) for exact math.
+
+```mermaid
+erDiagram
+    blocks ||--o{ transactions : contains
+    transactions ||--o{ transaction_inputs : has
+    transactions ||--o{ transaction_outputs : has
+    blocks {
+        VARCHAR hash
+        BIGINT number
+        VARCHAR timestamp
+        BIGINT transaction_count
+    }
+    transactions {
+        VARCHAR hash
+        BIGINT block_number
+        BOOLEAN is_coinbase
+        BIGINT fee
+        BIGINT output_value
+    }
+    transaction_inputs {
+        VARCHAR transaction_hash
+        VARCHAR spent_transaction_hash
+        VARCHAR type
+        VARCHAR_ARRAY addresses
+        BIGINT value
+    }
+    transaction_outputs {
+        VARCHAR transaction_hash
+        VARCHAR type
+        VARCHAR_ARRAY addresses
+        BIGINT value
+    }
+```
 
 | Table | Description |
 |---|---|
 | `blocks` | One row per block (hash, height, timestamp, size, weight, tx count, coinbase message) |
 | `transactions` | One row per tx (block ref, is_coinbase, input/output value, computed fee, sizes) |
-| `transaction_inputs` | One row per input (source tx, script, address(es), value) |
-| `transaction_outputs` | One row per output (script type, address(es), value) |
+| `transaction_inputs` | One row per input (source tx, `script_hex`, type, address(es), value) |
+| `transaction_outputs` | One row per output (`script_hex`, script type, address(es), value) |
 | `mempool_transactions` | Current unconfirmed transactions (fully refreshed every 15s) |
 | `mempool_snapshots` | Rolling 7-day history of mempool size/fee summaries |
 
@@ -147,10 +293,13 @@ All configuration is via environment variables.
 | `HEARTBEAT_SEC` | `15` | Resource/heartbeat log interval |
 
 <details>
-<summary>Advanced tuning (rarely needed)</summary>
+<summary>Performance tuning (match to your container's RAM/CPU)</summary>
 
 | Variable | Default | Description |
 |---|---|---|
+| `DUCKDB_MEMORY_LIMIT` | `1536MB` | DuckDB memory cap (raise it if the container has headroom) |
+| `DUCKDB_THREADS` | `2` | DuckDB worker threads (match to allotted CPUs) |
+| `FLUSH_TX_THRESHOLD` | `15000` | Transactions accumulated before each bulk write (lower = less peak memory) |
 | `WAL_WARN_MB` | `512` | Warn if the WAL grows past this (checkpointing stalled?) |
 | `DB_BLOAT_WARN_MB_PER_1K` | `100` | Warn on excessive DB growth per 1k blocks |
 | `RPC_SLOW_MS` | `5000` | Warn on RPC calls slower than this |
@@ -196,6 +345,26 @@ poison batch, checkpoint stall, disk-full, or node issue).
 
 ---
 
+## Startup sequence
+
+```mermaid
+sequenceDiagram
+    participant E as entrypoint.sh (root)
+    participant G as Gunicorn (app user)
+    participant M as btc_web_app
+
+    E->>E: fix /data perms, boot snapshot + counter
+    E->>E: delete stale WAL; remove DB if >20 GB (bloat guard)
+    E->>G: exec gosu app gunicorn ...
+    G->>M: import module (top-level code runs)
+    M->>M: open DuckDB, set memory/threads, ensure schema
+    M->>M: if schema mismatch → rebuild from genesis
+    M->>M: start blockchain + mempool + heartbeat threads
+    G->>G: serving on :5001
+```
+
+---
+
 ## Project structure
 
 ```
@@ -209,6 +378,7 @@ Dockerfile            Multi-stage build (frontend → Python runtime)
 docker-compose.yml    Local testnet4 Bitcoin Core node (dev only)
 setup.sh              One-command local dev setup
 frontend/             React + Vite + TypeScript UI (CodeMirror editor, Plotly charts)
+docs/                 Screenshots and documentation assets
 ```
 
 ---

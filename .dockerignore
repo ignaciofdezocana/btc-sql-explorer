@@ -28,3 +28,6 @@ __pycache__/
 README.md
 docker-compose.yml
 setup.sh
+
+# Docs (GitHub only)
+docs/
