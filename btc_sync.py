@@ -1161,7 +1161,10 @@ def _sync_once(
     # manageable.  The batch_size adjusts after every RPC batch.
     TARGET_TX = 5000
     MIN_BATCH = 5
-    MAX_BATCH = 100   # capped at 100 to prevent oversized RPC responses
+    # Cap on blocks per RPC batch. Lower values = smaller requests to Bitcoin
+    # Core = smaller memory/CPU spikes on the node (env-tunable so it can be
+    # made "node-friendly" on constrained devices).
+    MAX_BATCH = int(os.environ.get("RPC_MAX_BATCH", "100"))
 
     batch_num = 0  # RPC batches fetched
 

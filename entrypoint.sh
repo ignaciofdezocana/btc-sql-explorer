@@ -67,18 +67,15 @@ else
     log "no WAL file found (clean state)"
 fi
 
-# ── Detect and remove bloated database ──────────────────────────────
-# v1.7.x once bloated the DB to 47 GB via repeated OOM rollbacks with no
-# VACUUM. If the file is >20 GB, delete it so sync rebuilds cleanly.
+# ── Report database size (informational only) ───────────────────────
+# NOTE: we deliberately do NOT delete the DB based on size. A full
+# transaction-level mainnet sync is legitimately hundreds of GB, so a
+# size threshold would destroy real progress on every restart. Genuine
+# corruption is handled elsewhere: stale-WAL cleanup (above) and the
+# app's startup schema check (rebuilds only on an incompatible schema).
 if [ -f "$DB_PATH" ]; then
-    DB_SIZE_BYTES=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
     DB_SIZE_HR=$(du -h "$DB_PATH" 2>/dev/null | cut -f1)
-    log "database size: ${DB_SIZE_HR} (${DB_SIZE_BYTES} bytes)"
-    if [ "$DB_SIZE_BYTES" -gt 21474836480 ] 2>/dev/null; then
-        log "WARNING database is bloated (${DB_SIZE_HR}) — removing to rebuild cleanly"
-        rm -f "$DB_PATH"
-        log "bloated database removed; sync will restart from block 0"
-    fi
+    log "database present: ${DB_SIZE_HR} (kept — sync resumes from here)"
 else
     log "no existing database — will be created on first sync"
 fi

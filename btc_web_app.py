@@ -38,7 +38,7 @@ from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
 setup_logging()
 log = logging.getLogger("web")
 
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.7")
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.8")
 LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
 
@@ -193,7 +193,9 @@ _RPC_PASS = os.environ.get("BITCOIN_RPC_PASS", "bitcoin")
 
 _HEARTBEAT_SEC = int(os.environ.get("HEARTBEAT_SEC", "15"))
 _WAL_WARN_MB = float(os.environ.get("WAL_WARN_MB", "512"))          # 2x the 256MB autocheckpoint
-_BLOAT_WARN_MB_PER_1K = float(os.environ.get("DB_BLOAT_WARN_MB_PER_1K", "100"))
+# Dense-era blocks legitimately produce ~200 MB per 1k blocks, so the old
+# 100 threshold was a constant false alarm. Only warn well above that.
+_BLOAT_WARN_MB_PER_1K = float(os.environ.get("DB_BLOAT_WARN_MB_PER_1K", "400"))
 
 
 def _heartbeat_loop():
