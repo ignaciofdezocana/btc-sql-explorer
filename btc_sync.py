@@ -353,20 +353,24 @@ CREATE TABLE IF NOT EXISTS mempool_snapshots (
 );
 """
 
+# Only the tiny `blocks` table is indexed. Indexes over the huge
+# transactions / inputs / outputs tables (hundreds of millions of rows) need
+# far more than DuckDB's memory budget to build and would OOM — and DuckDB's
+# columnar engine scans those tables fast without them. (Building them at
+# startup was the v1.8.8/1.8.9 crash-loop cause.)
 CREATE_INDEXES_SQL = """
-CREATE INDEX IF NOT EXISTS idx_blocks_hash             ON blocks(hash);
-CREATE INDEX IF NOT EXISTS idx_blocks_number           ON blocks(number);
-CREATE INDEX IF NOT EXISTS idx_transactions_hash       ON transactions(hash);
-CREATE INDEX IF NOT EXISTS idx_transactions_block_num  ON transactions(block_number);
-CREATE INDEX IF NOT EXISTS idx_inputs_tx_hash          ON transaction_inputs(transaction_hash);
-CREATE INDEX IF NOT EXISTS idx_outputs_tx_hash         ON transaction_outputs(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_hash   ON blocks(hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_number ON blocks(number);
 """
 
+# Clean up any large indexes left over from older versions (cheap: dropping an
+# index is a metadata op), plus the small blocks indexes for the bulk-sync path.
 DROP_INDEXES_SQL = """
 DROP INDEX IF EXISTS idx_blocks_hash;
 DROP INDEX IF EXISTS idx_blocks_number;
 DROP INDEX IF EXISTS idx_transactions_hash;
 DROP INDEX IF EXISTS idx_transactions_block_num;
+DROP INDEX IF EXISTS idx_transactions_block_hash;
 DROP INDEX IF EXISTS idx_inputs_tx_hash;
 DROP INDEX IF EXISTS idx_outputs_tx_hash;
 """
@@ -436,12 +440,16 @@ EXPECTED_COLUMNS = {
 
 
 def ensure_schema(con: duckdb.DuckDBPyConnection):
-    """Create tables, indexes, and views if they do not exist."""
+    """Create tables and views if they do not exist.
+
+    Indexes are intentionally NOT created here. ensure_schema() runs at
+    startup, and (re)building an index over the huge transaction tables can
+    exceed DuckDB's memory limit — an unhandled OOM here crashes the worker
+    on boot, producing a restart loop. Index management is left to the sync
+    thread (create_indexes), which is wrapped so an index failure is never
+    fatal. Tables and views are cheap/metadata-only and safe to ensure here.
+    """
     for stmt in CREATE_TABLES_SQL.strip().split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            con.execute(stmt)
-    for stmt in CREATE_INDEXES_SQL.strip().split(";"):
         stmt = stmt.strip()
         if stmt:
             con.execute(stmt)

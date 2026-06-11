@@ -38,7 +38,7 @@ from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
 setup_logging()
 log = logging.getLogger("web")
 
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.9")
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.10")
 LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
 
