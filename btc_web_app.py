@@ -38,7 +38,7 @@ from btc_mempool_sync import mempool_sync_thread as _mempool_sync_thread
 setup_logging()
 log = logging.getLogger("web")
 
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.8")
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.9")
 LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
 
@@ -196,6 +196,11 @@ _WAL_WARN_MB = float(os.environ.get("WAL_WARN_MB", "512"))          # 2x the 256
 # Dense-era blocks legitimately produce ~200 MB per 1k blocks, so the old
 # 100 threshold was a constant false alarm. Only warn well above that.
 _BLOAT_WARN_MB_PER_1K = float(os.environ.get("DB_BLOAT_WARN_MB_PER_1K", "400"))
+# Memory alarms key off DEVICE-WIDE free RAM (what actually predicts an OOM
+# that can kill the node) — NOT the app's own cgroup %, which sits ~95% by
+# design (mostly reclaimable page cache) and used to cry wolf constantly.
+_SYS_FREE_WARN_MB = float(os.environ.get("SYS_FREE_WARN_MB", "1500"))
+_SYS_FREE_CRIT_MB = float(os.environ.get("SYS_FREE_CRITICAL_MB", "800"))
 
 
 def _heartbeat_loop():
@@ -223,11 +228,20 @@ def _heartbeat_loop():
                     _i(snap["disk_free_mb"]), threading.active_count(), age,
                     (f"{per1k:.0f}" if per1k else "?"))
 
-            if pct_mem is not None and pct_mem >= 90:
-                hb.warning("MEMORY_CRITICAL cgroup at %.1f%% of cap (%s/%sMB) — OOM kill imminent",
-                           pct_mem, _i(used), _i(lim))
-            elif pct_mem is not None and pct_mem >= 80:
-                hb.warning("MEMORY_HIGH cgroup at %.1f%% of cap (%s/%sMB)", pct_mem, _i(used), _i(lim))
+            # DEVICE-WIDE free RAM — the real OOM signal (this is what got the
+            # Bitcoin node killed). cgroup % is NOT used: it's ~95% by design.
+            avail = snap["sys_avail_mb"]
+            if avail is not None and avail < _SYS_FREE_CRIT_MB:
+                hb.warning("SYSTEM_MEMORY_CRITICAL device free RAM %sMB < %sMB — OOM risk, "
+                           "the Bitcoin node could be killed", _i(avail), _i(_SYS_FREE_CRIT_MB))
+            elif avail is not None and avail < _SYS_FREE_WARN_MB:
+                hb.warning("SYSTEM_MEMORY_LOW device free RAM %sMB < %sMB", _i(avail), _i(_SYS_FREE_WARN_MB))
+            # The app's OWN process is only at risk if its anonymous memory (RSS)
+            # nears its cap — the rest of cgroup_used is reclaimable page cache.
+            rss = snap["rss_mb"]
+            if rss is not None and lim and rss > 0.92 * lim:
+                hb.warning("APP_MEMORY_HIGH rss=%sMB near container cap %sMB — app may restart "
+                           "(it will resume, not lose data)", _i(rss), _i(lim))
             if wal_mb and wal_mb > _WAL_WARN_MB:
                 hb.warning("WAL_NOT_CHECKPOINTING wal=%sMB exceeds %sMB — checkpointing may have "
                            "stopped (v1.7.x OOM signature)", _i(wal_mb), _i(_WAL_WARN_MB))
